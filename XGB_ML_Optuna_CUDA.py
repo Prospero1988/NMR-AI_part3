@@ -9,21 +9,21 @@ import setuptools
 import warnings
 import os
 import pandas as pd
+import xgboost as xgb
 import cupy as cp
+import numpy as np
 import joblib
 import sys
 import logging
 from logging.handlers import RotatingFileHandler
 import optuna
 import mlflow
-import mlflow.pyfunc
+import mlflow.xgboost
 import matplotlib.pyplot as plt
 import optuna.visualization as vis
 import argparse
 import subprocess
 from mlflow.models.signature import infer_signature
-from cuml.svm import SVR
-from sklearn.model_selection import KFold
 
 def setup_logging(logger_name, log_file):
     logger = logging.getLogger(logger_name)
@@ -54,7 +54,7 @@ def check_input_directory(input_directory):
         logging.error(f"Directory {input_directory} does not exist.")
         sys.exit(1)
 
-    csv_files = [f for f in os.listdir(input_directory) if f.endswith('.csv')]
+    csv_files = sorted([f for f in os.listdir(input_directory) if f.endswith('.csv')])
 
     if not csv_files:
         logging.error("No CSV files found in the input directory.")
@@ -69,14 +69,18 @@ def load_data(file_path):
 
 def log_search_space():
     search_space = {
-        'C': ('float', 1e-5, 100.0, 'log'),  # Regularization parameter. Inverse of regularization strength.
-        'epsilon': ('float', 1e-5, 1.0, 'log'),  # Epsilon in the epsilon-SVR model.
-        'kernel': ('categorical', ['linear', 'poly', 'rbf', 'sigmoid']),  # Specifies the kernel type.
-        'degree': ('int', 2, 5),  # Degree of the polynomial kernel function ('poly'). Ignored by other kernels.
-        'gamma': ('categorical', ['scale', 'auto']),  # Kernel coefficient for 'rbf', 'poly', and 'sigmoid'.
-        'coef0': ('float', 0.0, 1.0),  # Independent term in kernel function. Only for 'poly' and 'sigmoid'.
-        'tol': ('float', 1e-5, 1e-1, 'log'),  # Tolerance for stopping criterion.
-        'max_iter': ('int', -1, 1000),  # Limit on iterations within solver, or -1 for no limit.
+        'max_depth': ('int', 1, 20),
+        'learning_rate': ('float', 1e-5, 0.5, 'log'),
+        'subsample': ('float', 0.1, 1.0),
+        'colsample_bytree': ('float', 0.1, 1.0),
+        'colsample_bylevel': ('float', 0.1, 1.0),
+        'colsample_bynode': ('float', 0.1, 1.0),
+        'min_child_weight': ('float', 0.1, 10.0),
+        'gamma': ('float', 0.0, 5.0),
+        'reg_lambda': ('float', 1e-8, 100.0, 'log'),
+        'reg_alpha': ('float', 1e-8, 100.0, 'log'),
+        'max_delta_step': ('float', 0.0, 10.0),
+        'grow_policy': ('categorical', ['depthwise', 'lossguide']),
     }
     mlflow.log_dict(search_space, 'hyperparameter_search_space.json')
 
@@ -108,80 +112,74 @@ def optimize_hyperparameters(X, y, logger, csv_file):
         # Assign GPU ID based on trial number
         gpu_id = trial.number % num_gpus
         cp.cuda.Device(gpu_id).use()  # Set the current GPU
-
-        params = {
-            'C': trial.suggest_float('C', 1e-5, 100.0, log=True),  # Regularization parameter
-            'epsilon': trial.suggest_float('epsilon', 1e-5, 1.0, log=True),  # Epsilon in the epsilon-SVR model
-            'kernel': trial.suggest_categorical('kernel', ['linear', 'poly', 'rbf', 'sigmoid']),  # Kernel type
-            'tol': trial.suggest_float('tol', 1e-5, 1e-1, log=True),  # Tolerance for stopping criterion
-            'max_iter': trial.suggest_int('max_iter', -1, 1000),  # Max iterations
+        params = {        
+            'verbosity': 0,
+            'objective': 'reg:squarederror',
+            'tree_method': 'gpu_hist',
+            'device': f'cuda:{gpu_id}',
+            'max_depth': trial.suggest_int('max_depth', 1, 20),
+            'learning_rate': trial.suggest_float('learning_rate', 1e-5, 0.5, log=True),
+            'subsample': trial.suggest_float('subsample', 0.1, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.1, 1.0),
+            'colsample_bylevel': trial.suggest_float('colsample_bylevel', 0.1, 1.0),
+            'colsample_bynode': trial.suggest_float('colsample_bynode', 0.1, 1.0),
+            'min_child_weight': trial.suggest_float('min_child_weight', 0.1, 10.0),
+            'gamma': trial.suggest_float('gamma', 0.0, 5.0),
+            'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 100.0, log=True),
+            'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 100.0, log=True),
+            'max_delta_step': trial.suggest_float('max_delta_step', 0.0, 10.0),
+            'grow_policy': trial.suggest_categorical('grow_policy', ['depthwise', 'lossguide']),
         }
 
-        # Handle 'degree' and 'coef0' only if kernel is 'poly'
-        if params['kernel'] == 'poly':
-            params['degree'] = trial.suggest_int('degree', 2, 5)  # Degree of polynomial kernel
-            params['coef0'] = trial.suggest_float('coef0', 0.0, 1.0)  # Independent term in kernel function
-        else:
-            params['degree'] = 3  # Default value
-            params['coef0'] = 0.0  # Default value
+        dtrain = xgb.DMatrix(X, label=y)
 
-        # Handle 'gamma' directly
-        if params['kernel'] in ['rbf', 'poly', 'sigmoid']:
-            gamma_type = trial.suggest_categorical('gamma_type', ['scale', 'auto', 'float'])
-            if gamma_type == 'float':
-                params['gamma'] = trial.suggest_float('gamma', 1e-5, 100.0, log=True)
-            else:
-                params['gamma'] = gamma_type
-        else:
-            params['gamma'] = 'scale'  # Default value for kernels that don't use 'gamma'
+        num_boost_round = 5000
+        early_stopping_rounds = 30
 
-        # Now perform K-Fold cross-validation
-        kf = KFold(n_splits=5, shuffle=True, random_state=69)
-        rmse_scores = []
-        for fold, (train_index, val_index) in enumerate(kf.split(X.get())):
-            X_train, X_val = X[train_index], X[val_index]
-            y_train, y_val = y[train_index], y[val_index]
+        cv_results = xgb.cv(
+            params,
+            dtrain,
+            num_boost_round=num_boost_round,
+            nfold=5,
+            metrics='rmse',  # Only RMSE
+            early_stopping_rounds=early_stopping_rounds,
+            seed=69,
+            verbose_eval=False,
+            as_pandas=True,
+        )
 
-            model = SVR(**params)
-            model.fit(X_train, y_train)
-            y_pred = model.predict(X_val)
-            # Compute RMSE using CuPy
-            rmse = cp.sqrt(cp.mean((y_val - y_pred) ** 2)).item()
-            rmse_scores.append(rmse)
-        mean_rmse = cp.mean(cp.asarray(rmse_scores)).item()
+        mean_rmse = cv_results['test-rmse-mean'].iloc[-1]
 
-        trial.set_user_attr('num_boost_round', 0)  # Placeholder for compatibility
+        trial.set_user_attr('num_boost_round', len(cv_results))
 
         # Log RMSE
         mlflow.log_metric('rmse', mean_rmse, step=trial.number)
 
         # Log hyperparameters as metrics
+        # Numeric hyperparameters
         numeric_params = {
-            'C': params['C'],
-            'epsilon': params['epsilon'],
-            'tol': params['tol'],
-            'max_iter': params['max_iter'],
+            'max_depth': params['max_depth'],
+            'learning_rate': params['learning_rate'],
+            'subsample': params['subsample'],
+            'colsample_bytree': params['colsample_bytree'],
+            'colsample_bylevel': params['colsample_bylevel'],
+            'colsample_bynode': params['colsample_bynode'],
+            'min_child_weight': params['min_child_weight'],
+            'gamma': params['gamma'],
+            'reg_lambda': params['reg_lambda'],
+            'reg_alpha': params['reg_alpha'],
+            'max_delta_step': params['max_delta_step'],
         }
-        if params['kernel'] == 'poly':
-            numeric_params['degree'] = params['degree']
-            numeric_params['coef0'] = params['coef0']
-        
-        # Include 'gamma' in numeric_params if it's a float
-        if isinstance(params['gamma'], float):
-            numeric_params['gamma'] = params['gamma']
-        
         for param_name, param_value in numeric_params.items():
             mlflow.log_metric(param_name, param_value, step=trial.number)
-        
+
         # Categorical hyperparameters
         categorical_params = {
-            'kernel': params['kernel'],
+            'grow_policy': params['grow_policy'],
         }
-        if not isinstance(params['gamma'], float):
-            categorical_params['gamma'] = params['gamma']
-        
-        for param_name, param_value in categorical_params.items():
-            mlflow.log_param(f"{param_name}_{trial.number}", param_value)
+        # Map categorical values to numeric codes
+        grow_policy_mapping = {'depthwise': 0, 'lossguide': 1}
+        mlflow.log_metric('grow_policy', grow_policy_mapping[categorical_params['grow_policy']], step=trial.number)
 
         # Collect trial data
         trial_data = {
@@ -199,7 +197,7 @@ def optimize_hyperparameters(X, y, logger, csv_file):
 
     # Initialize trial data list
     optimize_hyperparameters.trial_data_list = []
-
+ 
     study = optuna.create_study(
         direction='minimize',
         sampler=optuna.samplers.TPESampler(),
@@ -208,8 +206,8 @@ def optimize_hyperparameters(X, y, logger, csv_file):
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)  # Suppress Optuna logs
 
-    # Set n_jobs=-1 to effective use all CPUs and GPUs
-    study.optimize(objective, n_trials=2000, n_jobs=-1)
+    # Set n_jobs=1 to avoid GPU conflicts
+    study.optimize(objective, n_trials=3000, n_jobs=-1)
 
     # After optimization, get gpu_id from the best trial
     best_trial_number = study.best_trial.number
@@ -217,13 +215,14 @@ def optimize_hyperparameters(X, y, logger, csv_file):
     logger.info(f"Best trial number: {best_trial_number}, Best GPU ID: {gpu_id}")
 
     best_params = study.best_params
-    # Remove 'gamma_type' from best_params if it exists
-    best_params.pop('gamma_type', None)
     best_params.update({
-        # Additional parameters if needed
+        'verbosity': 0,
+        'objective': 'reg:squarederror',
+        'tree_method': 'gpu_hist',
+        'device': f'cuda:{gpu_id}',
     })
 
-    num_boost_round = study.best_trial.user_attrs.get('num_boost_round', 0)
+    num_boost_round = study.best_trial.user_attrs['num_boost_round']
 
     # Log best hyperparameters as parameters in MLflow
     mlflow.log_params(best_params)
@@ -256,14 +255,23 @@ def optimize_hyperparameters(X, y, logger, csv_file):
 
     return best_params, num_boost_round, param_importances, param_importances_file, study
 
-def train_final_model(X, y, best_params):
-    model = SVR(**best_params)
-    model.fit(X, y)
-    return model
+def train_final_model(X, y, best_params, num_boost_round):
+    dtrain = xgb.DMatrix(X, label=y)
+    evals_result = {}
+    model = xgb.train(
+        best_params,
+        dtrain,
+        num_boost_round=num_boost_round,
+        evals=[(dtrain, 'train')],
+        evals_result=evals_result,
+        verbose_eval=False
+    )
+    return model, evals_result
 
 def evaluate_model(model, X, y):
-    y_pred = model.predict(X)
-    y_pred = cp.asarray(y_pred)  # Ensure y_pred is a CuPy array
+    dtrain = xgb.DMatrix(X, label=y)
+    y_pred = model.predict(dtrain)
+    y_pred = cp.asarray(y_pred)  # Convert y_pred to CuPy array
 
     # Compute metrics using CuPy
     abs_error = cp.abs(y - y_pred)
@@ -328,16 +336,37 @@ def save_metrics_and_params(metrics, params, file_name, logger):
     logger.info(f"Metrics and hyperparameters saved to {file_name}")
 
 def log_feature_importances(model, feature_names):
-    # SVR does not have feature importances
-    logging.info("SVR model does not provide feature importances.")
-    # Optionally, log this info in MLflow
-    mlflow.log_param('feature_importances', 'Not available for SVR')
+    importances = model.get_score(importance_type='gain')
+    # Map feature indices to names
+    importances = {feature_names[int(k[1:])]: v for k, v in importances.items()}
+    # Log as MLflow artifact
+    importance_df = pd.DataFrame(list(importances.items()), columns=['Feature', 'Importance'])
+    importance_df.sort_values(by='Importance', ascending=False, inplace=True)
+    importance_csv = 'feature_importances.csv'
+    importance_df.to_csv(importance_csv, index=False)
+    mlflow.log_artifact(importance_csv)
+    # Plot and log the feature importances
+    plt.figure(figsize=(10, 8))
+    plt.barh(importance_df['Feature'], importance_df['Importance'])
+    plt.xlabel('Importance')
+    plt.ylabel('Feature')
+    plt.title('Feature Importances')
+    plt.tight_layout()
+    plt.gca().invert_yaxis()  # So that the most important feature is at the top
+    plt.savefig('feature_importances.png')
+    mlflow.log_artifact('feature_importances.png')
 
 def log_learning_curve(evals_result):
-    # SVR does not have evals_result or learning curve data
-    logging.info("SVR model does not provide learning curve data.")
-    # Optionally, log this info in MLflow
-    mlflow.log_param('learning_curve', 'Not available for SVR')
+    plt.figure()
+    epochs = len(evals_result['train']['rmse'])
+    x_axis = range(0, epochs)
+    plt.plot(x_axis, evals_result['train']['rmse'], label='Train')
+    plt.legend()
+    plt.ylabel('RMSE')
+    plt.xlabel('Boosting Round')
+    plt.title('XGBoost Training Curve')
+    plt.savefig('learning_curve.png')
+    mlflow.log_artifact('learning_curve.png')
 
 def process_file(csv_file, input_directory):
     try:
@@ -382,7 +411,7 @@ def process_file(csv_file, input_directory):
                 mlflow.log_params(best_params)
 
                 # Train the model
-                model = train_final_model(X, y, best_params)
+                model, evals_result = train_final_model(X, y, best_params, num_boost_round)
 
                 # Evaluate the model
                 metrics, per_instance_data = evaluate_model(model, X, y)
@@ -402,23 +431,10 @@ def process_file(csv_file, input_directory):
 
                 # Log the model to MLflow in standard format with signature and input example
                 input_example = pd.DataFrame(cp.asnumpy(X[:5]))
-                signature = infer_signature(input_example, cp.asnumpy(model.predict(X[:5])))
-
-                class CumlModelWrapper(mlflow.pyfunc.PythonModel):
-
-                    def __init__(self, model):
-                        self.model = model
-
-                    def predict(self, context, model_input):
-                        import cupy as cp
-                        X = cp.asarray(model_input.values)
-                        y_pred = self.model.predict(X)
-                        return cp.asnumpy(y_pred)
-
-                cuml_model_wrapper = CumlModelWrapper(model)
-                mlflow.pyfunc.log_model(
+                signature = infer_signature(input_example, model.predict(xgb.DMatrix(X[:5])))
+                mlflow.xgboost.log_model(
+                    model,
                     artifact_path="model",
-                    python_model=cuml_model_wrapper,
                     signature=signature,
                     input_example=input_example
                 )
@@ -433,7 +449,7 @@ def process_file(csv_file, input_directory):
                 log_feature_importances(model, feature_names)
 
                 # Log learning curve
-                log_learning_curve(None)
+                log_learning_curve(evals_result)
 
                 logger.info(
                     f"Metrics for {csv_file}: RMSE: {metrics['RMSE']:.4f}, "
@@ -444,16 +460,11 @@ def process_file(csv_file, input_directory):
 
     except Exception as e:
         logging.error(f"Error processing {csv_file}: {e}", exc_info=True)
-        # End any active runs before logging exception
-        if mlflow.active_run():
-            mlflow.end_run()
-        # Use a unique key for the exception to avoid conflicts
-        with mlflow.start_run(run_name=f"Error_{csv_file}", nested=True):
-            mlflow.log_param(f'Exception_{csv_file}', str(e))
+        mlflow.log_param('Exception', str(e))
 
 def main():
     # Handle command-line arguments
-    parser = argparse.ArgumentParser(description='SVR Hyperparameter Optimization with MLflow and Optuna')
+    parser = argparse.ArgumentParser(description='XGBoost Hyperparameter Optimization with MLflow and Optuna')
     parser.add_argument('input_directory', type=str, help='Path to the input directory containing CSV files')
     parser.add_argument('--experiment_name', type=str, default='Default', help='Name of the MLflow experiment')
     args = parser.parse_args()
@@ -468,9 +479,6 @@ def main():
 
     for csv_file in csv_files:
         process_file(csv_file, input_directory)
-        # Ensure that each run is properly ended
-        if mlflow.active_run():
-            mlflow.end_run()
 
 if __name__ == "__main__":
     main()

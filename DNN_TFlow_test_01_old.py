@@ -35,7 +35,6 @@ from tensorflow import keras
 from tensorflow.keras import layers, models
 from tensorflow.keras.callbacks import EarlyStopping
 from tensorflow.python.client import device_lib
-from tensorflow.keras import backend as K
 
 # Import KFold from sklearn for indices
 from sklearn.model_selection import KFold
@@ -105,13 +104,13 @@ def load_data(file_path):
 
 def log_search_space():
     search_space = {
-        'num_layers': ('int', 2, 10),
-        'units': ('int', 256, 2048),
+        'num_layers': ('int', 1, 5),
+        'units': ('int', 32, 512),
         'activation': ('categorical', ['relu', 'tanh', 'sigmoid']),
         'dropout_rate': ('float', 0.0, 0.5),
         'optimizer': ('categorical', ['adam', 'rmsprop', 'sgd']),
         'learning_rate': ('float', 1e-5, 1e-1, 'log'),
-        'batch_size': ('int', 32, 512),
+        'batch_size': ('int', 16, 128),
         'epochs': ('int', 10, 100),
     }
     mlflow.log_dict(search_space, 'hyperparameter_search_space.json')
@@ -202,10 +201,7 @@ def optimize_hyperparameters(X, y, logger, csv_file):
             val_rmse = np.sqrt(val_mse)
 
             rmse_scores.append(val_rmse)
-            
-            # Zwolnienie zasobów modelu
-            K.clear_session()
-    
+
         mean_rmse = np.mean(rmse_scores)
 
         # Log RMSE
@@ -244,9 +240,6 @@ def optimize_hyperparameters(X, y, logger, csv_file):
         if not hasattr(optimize_hyperparameters, 'trial_data_list'):
             optimize_hyperparameters.trial_data_list = []
         optimize_hyperparameters.trial_data_list.append(trial_data)
-
-        # Zwolnienie zasobów po trialu
-        K.clear_session()
 
         return mean_rmse
 

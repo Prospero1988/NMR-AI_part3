@@ -7,9 +7,9 @@ Created on Wed Sep 18 07:38:56 2024
 
 import warnings
 import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Ustaw na '3', aby wyciszyć więcej komunikatów
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Set to '3' to suppress more messages
 
-# Konfiguracja logowania
+# Logging configuration
 import logging
 logging.getLogger('tensorflow').setLevel(logging.ERROR)
 logging.getLogger('optuna').setLevel(logging.WARNING)
@@ -18,7 +18,6 @@ logging.getLogger('mlflow').setLevel(logging.WARNING)
 import pandas as pd
 import joblib
 import sys
-import logging
 from logging.handlers import RotatingFileHandler
 import optuna
 import mlflow
@@ -32,26 +31,21 @@ from mlflow.models.signature import infer_signature
 # Import TensorFlow and Keras
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers, models
+from tensorflow.keras import layers
 from tensorflow.keras.callbacks import EarlyStopping
-from tensorflow.python.client import device_lib
-from tensorflow.keras import backend as K
 
-# Import KFold from sklearn for indices
+# Import KFold from sklearn for final evaluation
 from sklearn.model_selection import KFold
-import numpy as np
 
-##print(device_lib.list_local_devices())
+# Import TensorFlow Probability for Pearson correlation
+import tensorflow_probability as tfp
 
 # Check if GPU is available
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
     print(f"GPUs Available: {gpus}")
     try:
-        # Restrict TensorFlow to only use the first GPU
-        tf.config.experimental.set_visible_devices(gpus[0], 'GPU')
-
-        # Or allow memory growth
+        # Enable memory growth
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
     except RuntimeError as e:
@@ -101,18 +95,20 @@ def check_input_directory(input_directory):
 
 def load_data(file_path):
     data = pd.read_csv(file_path)
-    return data.values  # Return as NumPy array
+    data = data.values  # Convert to NumPy array
+    data = tf.convert_to_tensor(data, dtype=tf.float32)
+    return data
 
 def log_search_space():
     search_space = {
-        'num_layers': ('int', 2, 10),
-        'units': ('int', 256, 2048),
+        'num_layers': ('int', 2, 20),
+        'units': ('int', 32, 2048),
         'activation': ('categorical', ['relu', 'tanh', 'sigmoid']),
         'dropout_rate': ('float', 0.0, 0.5),
         'optimizer': ('categorical', ['adam', 'rmsprop', 'sgd']),
         'learning_rate': ('float', 1e-5, 1e-1, 'log'),
         'batch_size': ('int', 32, 512),
-        'epochs': ('int', 10, 100),
+        'epochs': ('int', 10, 200),
     }
     mlflow.log_dict(search_space, 'hyperparameter_search_space.json')
 
@@ -134,7 +130,6 @@ def log_environment():
         except subprocess.CalledProcessError as e:
             logging.warning(f"Could not log pip requirements: {e}")
 
-
 def optimize_hyperparameters(X, y, logger, csv_file):
     logger.info("Starting hyperparameter optimization using TensorFlow/Keras.")
 
@@ -143,73 +138,74 @@ def optimize_hyperparameters(X, y, logger, csv_file):
 
     def objective(trial):
         params = {
-            'num_layers': trial.suggest_int('num_layers', 1, 5),
-            'units': trial.suggest_int('units', 32, 512),
+            'num_layers': trial.suggest_int('num_layers', 1, 10),
+            'units': trial.suggest_int('units', 32, 1024),
             'activation': trial.suggest_categorical('activation', ['relu', 'tanh', 'sigmoid']),
             'dropout_rate': trial.suggest_float('dropout_rate', 0.0, 0.5),
             'optimizer': trial.suggest_categorical('optimizer', ['adam', 'rmsprop', 'sgd']),
             'learning_rate': trial.suggest_float('learning_rate', 1e-5, 1e-1, log=True),
-            'batch_size': trial.suggest_int('batch_size', 16, 128),
+            'batch_size': trial.suggest_int('batch_size', 16, 256),
             'epochs': trial.suggest_int('epochs', 10, 100),
         }
 
-        kf = KFold(n_splits=5, shuffle=True, random_state=69)
-        rmse_scores = []
+        # Build the model
+        model = keras.Sequential()
+        input_shape = X.shape[1]
+        
+        # Add an Input layer first
+        model.add(layers.Input(shape=(input_shape,)))
 
-        for train_index, val_index in kf.split(X):
-            X_train, X_val = X[train_index], X[val_index]
-            y_train, y_val = y[train_index], y[val_index]
+        for i in range(params['num_layers']):
+            model.add(layers.Dense(params['units'], activation=params['activation']))
+            if params['dropout_rate'] > 0.0:
+                model.add(layers.Dropout(params['dropout_rate']))
+        
+        model.add(layers.Dense(1))  # Output layer
 
-            # Build the model
-            model = keras.Sequential()
-            input_shape = X_train.shape[1]
+        # Compile the model
+        optimizer_name = params['optimizer']
+        learning_rate = params['learning_rate']
+        if optimizer_name == 'adam':
+            optimizer = keras.optimizers.Adam(learning_rate=learning_rate)
+        elif optimizer_name == 'rmsprop':
+            optimizer = keras.optimizers.RMSprop(learning_rate=learning_rate)
+        else:
+            optimizer = keras.optimizers.SGD(learning_rate=learning_rate)
 
-            for i in range(params['num_layers']):
-                if i == 0:
-                    model.add(layers.Dense(params['units'], activation=params['activation'], input_dim=input_shape))
-                else:
-                    model.add(layers.Dense(params['units'], activation=params['activation']))
-                if params['dropout_rate'] > 0.0:
-                    model.add(layers.Dropout(params['dropout_rate']))
+        model.compile(optimizer=optimizer, loss='mean_squared_error', metrics=['mean_squared_error'])
 
-            model.add(layers.Dense(1))  # Output layer
+        # Early stopping
+        early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
 
-            # Compile the model
-            optimizer_name = params['optimizer']
-            learning_rate = params['learning_rate']
-            if optimizer_name == 'adam':
-                optimizer = keras.optimizers.Adam(learning_rate=learning_rate)
-            elif optimizer_name == 'rmsprop':
-                optimizer = keras.optimizers.RMSprop(learning_rate=learning_rate)
-            else:
-                optimizer = keras.optimizers.SGD(learning_rate=learning_rate)
+        # Split the data into training and validation sets
+        from sklearn.model_selection import train_test_split
+        X_train, X_val, y_train, y_val = train_test_split(
+            X.numpy(), y.numpy(), test_size=0.2, random_state=trial.number
+        )
 
-            model.compile(optimizer=optimizer, loss='mean_squared_error', metrics=['mean_squared_error'])
+        # Convert data to tf.data.Dataset
+        batch_size = params['batch_size']
+        train_dataset = tf.data.Dataset.from_tensor_slices((X_train, y_train))
+        train_dataset = train_dataset.shuffle(buffer_size=1024).batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
-            # Early stopping
-            early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+        val_dataset = tf.data.Dataset.from_tensor_slices((X_val, y_val))
+        val_dataset = val_dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
-            # Train the model
-            history = model.fit(X_train, y_train,
-                                validation_data=(X_val, y_val),
-                                epochs=params['epochs'],
-                                batch_size=params['batch_size'],
-                                callbacks=[early_stopping],
-                                verbose=0)
+        # Train the model without using validation_split
+        history = model.fit(
+            train_dataset,
+            epochs=params['epochs'],
+            validation_data=val_dataset,
+            callbacks=[early_stopping],
+            verbose=0
+        )
 
-            # Evaluate the model
-            val_mse = model.evaluate(X_val, y_val, verbose=0)[0]
-            val_rmse = np.sqrt(val_mse)
-
-            rmse_scores.append(val_rmse)
-            
-            # Zwolnienie zasobów modelu
-            K.clear_session()
-    
-        mean_rmse = np.mean(rmse_scores)
+        # Get the validation RMSE
+        val_mse = history.history['val_mean_squared_error'][-1]
+        val_rmse = tf.sqrt(val_mse).numpy().item()
 
         # Log RMSE
-        mlflow.log_metric('rmse', mean_rmse, step=trial.number)
+        mlflow.log_metric('rmse', val_rmse, step=trial.number)
 
         # Log numeric hyperparameters as metrics
         numeric_params = {
@@ -237,7 +233,7 @@ def optimize_hyperparameters(X, y, logger, csv_file):
         # Collect trial data
         trial_data = {
             'trial_number': trial.number,
-            'rmse': mean_rmse,
+            'rmse': val_rmse,
         }
         trial_data.update(params)
 
@@ -245,10 +241,7 @@ def optimize_hyperparameters(X, y, logger, csv_file):
             optimize_hyperparameters.trial_data_list = []
         optimize_hyperparameters.trial_data_list.append(trial_data)
 
-        # Zwolnienie zasobów po trialu
-        K.clear_session()
-
-        return mean_rmse
+        return val_rmse
 
     # Initialize trial data list
     optimize_hyperparameters.trial_data_list = []
@@ -256,12 +249,12 @@ def optimize_hyperparameters(X, y, logger, csv_file):
     study = optuna.create_study(
         direction='minimize',
         sampler=optuna.samplers.TPESampler(),
-        pruner=optuna.pruners.NopPruner()
+        pruner=optuna.pruners.MedianPruner()
     )
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)  # Suppress Optuna logs
 
-    study.optimize(objective, n_trials=100, n_jobs=1)
+    study.optimize(objective, n_trials=2000, n_jobs=1)
 
     best_trial_number = study.best_trial.number
     logger.info(f"Best trial number: {best_trial_number}")
@@ -297,74 +290,118 @@ def optimize_hyperparameters(X, y, logger, csv_file):
     trial_data_df.to_csv(trial_data_csv, index=False)
     mlflow.log_artifact(trial_data_csv)
 
+    # Ensure the return statement is present
     return best_params, param_importances, param_importances_file, study
 
 def train_final_model(X, y, best_params):
-    # Build the model
-    model = keras.Sequential()
-    input_shape = X.shape[1]
+    # KFold cross-validation with 10 folds
+    kf = KFold(n_splits=10, shuffle=True, random_state=69)
+    metrics_list = []
+    history_list = []
 
-    for i in range(best_params['num_layers']):
-        if i == 0:
-            model.add(layers.Dense(best_params['units'], activation=best_params['activation'], input_dim=input_shape))
-        else:
+    fold = 1
+    for train_index, test_index in kf.split(X):
+        print(f"Training on fold {fold}...")
+        X_train_fold = tf.gather(X, train_index)
+        X_test_fold = tf.gather(X, test_index)
+        y_train_fold = tf.gather(y, train_index)
+        y_test_fold = tf.gather(y, test_index)
+
+        # Build the model
+        model = keras.Sequential()
+        input_shape = X_train_fold.shape[1]
+        
+        # Add an Input layer first
+        model.add(layers.Input(shape=(input_shape,)))
+        
+        for i in range(best_params['num_layers']):
             model.add(layers.Dense(best_params['units'], activation=best_params['activation']))
-        if best_params['dropout_rate'] > 0.0:
-            model.add(layers.Dropout(best_params['dropout_rate']))
+            if best_params['dropout_rate'] > 0.0:
+                model.add(layers.Dropout(best_params['dropout_rate']))
+        
+        model.add(layers.Dense(1))  # Output layer
 
-    model.add(layers.Dense(1))  # Output layer
 
-    # Compile the model
-    optimizer_name = best_params['optimizer']
-    learning_rate = best_params['learning_rate']
-    if optimizer_name == 'adam':
-        optimizer = keras.optimizers.Adam(learning_rate=learning_rate)
-    elif optimizer_name == 'rmsprop':
-        optimizer = keras.optimizers.RMSprop(learning_rate=learning_rate)
-    else:
-        optimizer = keras.optimizers.SGD(learning_rate=learning_rate)
+        # Compile the model
+        optimizer_name = best_params['optimizer']
+        learning_rate = best_params['learning_rate']
+        if optimizer_name == 'adam':
+            optimizer = keras.optimizers.Adam(learning_rate=learning_rate)
+        elif optimizer_name == 'rmsprop':
+            optimizer = keras.optimizers.RMSprop(learning_rate=learning_rate)
+        else:
+            optimizer = keras.optimizers.SGD(learning_rate=learning_rate)
 
-    model.compile(optimizer=optimizer, loss='mean_squared_error', metrics=['mean_squared_error'])
+        model.compile(optimizer=optimizer, loss='mean_squared_error', metrics=['mean_squared_error'])
 
-    # Early stopping
-    early_stopping = EarlyStopping(monitor='loss', patience=5, restore_best_weights=True)
+        # Early stopping
+        early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
 
-    # Train the model
-    history = model.fit(X, y,
-                        epochs=best_params['epochs'],
-                        batch_size=best_params['batch_size'],
-                        callbacks=[early_stopping],
-                        verbose=0)
+        # Convert data to tf.data.Dataset
+        train_dataset = tf.data.Dataset.from_tensor_slices((X_train_fold, y_train_fold))
+        test_dataset = tf.data.Dataset.from_tensor_slices((X_test_fold, y_test_fold))
 
-    return model, history
+        # Shuffle, batch, and prefetch
+        batch_size = best_params['batch_size']
+        train_dataset = train_dataset.shuffle(buffer_size=1024).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+        test_dataset = test_dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+        # Train the model
+        history = model.fit(
+            train_dataset,
+            validation_data=test_dataset,
+            epochs=best_params['epochs'],
+            callbacks=[early_stopping],
+            verbose=0
+        )
+
+        # Evaluate the model
+        metrics, per_instance_data = evaluate_model(model, X_test_fold, y_test_fold)
+
+        metrics_list.append(metrics)
+        history_list.append(history)
+        fold += 1
+
+    # Compute average metrics using TensorFlow
+    avg_metrics = {}
+    for key in metrics_list[0].keys():
+        values = tf.constant([metric[key] for metric in metrics_list], dtype=tf.float32)
+        avg_metrics[key] = tf.reduce_mean(values).numpy().item()
+
+    return model, history_list, avg_metrics
 
 def evaluate_model(model, X, y):
     y_pred = model.predict(X).flatten()
 
-    # Compute metrics
-    abs_error = np.abs(y - y_pred)
+    # Convert y and y_pred to tensors if not already
+    y = tf.convert_to_tensor(y)
+    y_pred = tf.convert_to_tensor(y_pred)
+
+    # Compute metrics using TensorFlow
+    abs_error = tf.abs(y - y_pred)
     per_instance_data = pd.DataFrame({
-        'Actual': y,
-        'Predicted': y_pred,
-        'Absolute Error': abs_error
+        'Actual': y.numpy(),
+        'Predicted': y_pred.numpy(),
+        'Absolute Error': abs_error.numpy()
     })
 
     # Overall metrics
-    rmse = np.sqrt(np.mean((y - y_pred) ** 2))
-    mae = np.mean(abs_error)
+    rmse = tf.sqrt(tf.reduce_mean(tf.square(y - y_pred))).numpy().item()
+    mae = tf.reduce_mean(abs_error).numpy().item()
 
     # Compute MAPE safely
     epsilon = 1e-7  # Small value to avoid division by zero
-    mape_values = np.abs((y - y_pred) / np.maximum(np.abs(y), epsilon)) * 100
-    mape = np.mean(mape_values)
+    mape_values = tf.abs((y - y_pred) / tf.maximum(tf.abs(y), epsilon)) * 100
+    mape = tf.reduce_mean(mape_values).numpy().item()
 
-    ss_tot = np.sum((y - np.mean(y)) ** 2)
-    ss_res = np.sum((y - y_pred) ** 2)
-    r2 = (1 - ss_res / ss_tot)
+    ss_tot = tf.reduce_sum(tf.square(y - tf.reduce_mean(y)))
+    ss_res = tf.reduce_sum(tf.square(y - y_pred))
+    r2 = (1 - ss_res / ss_tot).numpy().item()
 
     # Pearson correlation coefficient
-    if y.size > 1:
-        pearson_corr = np.corrcoef(y, y_pred)[0, 1]
+    if y.shape[0] > 1:
+        pearson_corr = tfp.stats.correlation(y, y_pred, sample_axis=0, event_axis=None)
+        pearson_corr = pearson_corr.numpy().item()
     else:
         pearson_corr = float('nan')
 
@@ -377,11 +414,6 @@ def evaluate_model(model, X, y):
     }
 
     return metrics, per_instance_data
-
-
-def save_model(model, file_name, logger):
-    model.save(file_name)  # Saves in SavedModel format when file_name is a directory
-    logger.info(f"Model saved to {file_name}")
 
 def save_metrics_and_params(metrics, params, file_name, logger):
     with open(file_name, 'w', encoding='utf-8') as f:
@@ -402,12 +434,13 @@ def log_feature_importances(model, feature_names):
     logging.info("DNN model does not provide feature importances.")
     mlflow.log_param('feature_importances', 'Not available for DNN')
 
-def log_learning_curve(history):
-    if history is not None:
+def log_learning_curve(history_list):
+    if history_list:
         plt.figure()
-        plt.plot(history.history['loss'], label='train_loss')
-        if 'val_loss' in history.history:
-            plt.plot(history.history['val_loss'], label='val_loss')
+        for history in history_list:
+            plt.plot(history.history['loss'], label='train_loss')
+            if 'val_loss' in history.history:
+                plt.plot(history.history['val_loss'], label='val_loss')
         plt.title('Learning Curve')
         plt.xlabel('Epochs')
         plt.ylabel('Loss')
@@ -420,13 +453,12 @@ def log_learning_curve(history):
         logging.info("No learning curve data to plot.")
         mlflow.log_param('learning_curve', 'Not available')
 
-
 def process_file(csv_file, input_directory):
     try:
         data = load_data(os.path.join(input_directory, csv_file))
 
-        y = data[:, 0]
         X = data[:, 1:]
+        y = data[:, 0]
 
         # Start parent MLflow run
         with mlflow.start_run(run_name=f"Run_{csv_file}"):
@@ -437,7 +469,7 @@ def process_file(csv_file, input_directory):
             mlflow.set_tag('module', 'SPEC-AI')
             mlflow.set_tag('property', 'logD')
             mlflow.set_tag('paper', '3rd paper')
-
+            mlflow.set_tag('technology', 'DNN Keras')
             # Log environment
             log_environment()
 
@@ -464,47 +496,30 @@ def process_file(csv_file, input_directory):
                 mlflow.log_params(best_params)
 
                 # Train the model
-                model, history = train_final_model(X, y, best_params)
-
-                # Evaluate the model
-                metrics, per_instance_data = evaluate_model(model, X, y)
+                model, history_list, metrics = train_final_model(X, y, best_params)
 
                 # Log metrics
                 mlflow.log_metrics(metrics)
 
-                # Save per-instance data
-                per_instance_data_file = f"{os.path.splitext(csv_file)[0]}_per_instance_data.csv"
-                per_instance_data.to_csv(per_instance_data_file, index=False)
-                mlflow.log_artifact(per_instance_data_file)
-
-                # Save the model and log as artifact
-                #model_file_name = f"{os.path.splitext(csv_file)[0]}_optimized_model"
-                # save_model(model, model_file_name, logger)
-                # mlflow.log_artifact(model_file_name)
-
                 # Log the model to MLflow using mlflow.keras
-                # Zamiast używać DataFrame, użyj NumPy array
-                input_example = X[:5]  # NumPy array
+                # Prepare input example
+                #input_example = X[:5].numpy()  # Convert TensorFlow tensor to NumPy array
+                #input_example = pd.DataFrame(input_example)
                 
-                # Upewnij się, że input_example ma typ float32
-                input_example = input_example.astype(np.float32)
+                # Predict using the model (ensure input is in the correct format)
+                #predictions = model.predict(input_example)
                 
-                # Przewiduj na podstawie input_example
-                predictions = model.predict(input_example)
+                # Infer signature
+                #signature = infer_signature(input_example, predictions)
                 
-                # Upewnij się, że predictions mają odpowiedni typ
-                predictions = predictions.astype(np.float32)
-                
-                # Inferuj sygnaturę
-                signature = infer_signature(input_example, predictions)
-                
-                # Loguj model
+                # Log the model
                 mlflow.keras.log_model(
                     model=model,
                     artifact_path="model",
-                    signature=signature,
-                    input_example=input_example
+                    #signature=signature,
+                    #input_example=input_example
                 )
+
 
                 # Save metrics and parameters
                 metrics_file_name = f"{os.path.splitext(csv_file)[0]}_optimized_metrics_and_params.txt"
@@ -516,7 +531,7 @@ def process_file(csv_file, input_directory):
                 log_feature_importances(model, feature_names)
 
                 # Log learning curve
-                log_learning_curve(history)
+                log_learning_curve(history_list)
 
                 logger.info(
                     f"Metrics for {csv_file}: RMSE: {metrics['RMSE']:.4f}, "
