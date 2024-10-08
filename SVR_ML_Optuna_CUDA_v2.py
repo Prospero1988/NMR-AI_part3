@@ -349,8 +349,8 @@ def process_file(csv_file, input_directory):
     try:
         data = load_data(os.path.join(input_directory, csv_file))
 
-        y = data[:, 0]
-        X = data[:, 1:]
+        y = data[:, 1]
+        X = data[:, 2:]
 
         # Start parent MLflow run
         with mlflow.start_run(run_name=f"Run_{csv_file}"):

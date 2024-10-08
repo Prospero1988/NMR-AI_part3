@@ -207,7 +207,7 @@ def optimize_hyperparameters(X, y, logger, csv_file):
     optuna.logging.set_verbosity(optuna.logging.WARNING)  # Suppress Optuna logs
 
     # Set n_jobs=1 to avoid GPU conflicts
-    study.optimize(objective, n_trials=3000, n_jobs=-1)
+    study.optimize(objective, n_trials=3000, n_jobs=1)
 
     # After optimization, get gpu_id from the best trial
     best_trial_number = study.best_trial.number
@@ -372,8 +372,8 @@ def process_file(csv_file, input_directory):
     try:
         data = load_data(os.path.join(input_directory, csv_file))
 
-        y = data[:, 0]
-        X = data[:, 1:]
+        y = data[:, 1]
+        X = data[:, 2:]
 
         # Start parent MLflow run
         with mlflow.start_run(run_name=f"Run_{csv_file}"):
