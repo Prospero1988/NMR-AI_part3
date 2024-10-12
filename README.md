@@ -6,6 +6,7 @@ This repository contains two Python scripts designed for optimizing machine lear
 ## Files
 - `SVR_ML_Optuna_CUDA_v2.py`: This script performs Support Vector Regression (SVR) hyperparameter optimization using Optuna, MLflow for logging, and CUDA for GPU acceleration. It includes data loading, model training, and evaluation routines.
 - `XGB_ML_Optuna_CUDA.py`: This script focuses on XGBoost model optimization using Optuna and MLflow, also leveraging CUDA for accelerated training.
+- `conda_environment.yml`: A YAML file describing the conda environment required to run the scripts, including necessary dependencies.
 
 ### Key Features
 - **Hyperparameter Optimization**: Both scripts use Optuna to optimize key model parameters.
@@ -21,12 +22,16 @@ This repository contains two Python scripts designed for optimizing machine lear
 Ensure you have the following installed:
 - CUDA-enabled GPU
 - Python 3.x
-- `cupy`, `optuna`, `mlflow`, `pandas`, `joblib`, `scikit-learn`, `matplotlib`, `xgboost` (for XGB), and `cuml` (for SVR)
+- The required Python packages listed in `conda_environment.yml`
 
-To install the necessary packages, use the following:
+You can create the conda environment by running:
 ```bash
-pip install cupy optuna mlflow pandas joblib scikit-learn matplotlib xgboost cuml
+conda env create -f conda_environment.yml
+conda activate optuna_new
 ```
+
+This will install the necessary packages, including:
+- `cupy`, `optuna`, `mlflow`, `pandas`, `joblib`, `scikit-learn`, `matplotlib`, `xgboost`, and `cuml`.
 
 ### Environment
 Make sure your environment is set up for CUDA, and that the necessary drivers and libraries are installed (e.g., `nvidia-cuda-toolkit`).
