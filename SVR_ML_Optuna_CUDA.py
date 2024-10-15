@@ -118,7 +118,7 @@ def optimize_hyperparameters(X, y, logger, csv_file):
         params = {
             'C': trial.suggest_float('C', 1e-5, 100.0, log=True),  # Regularization parameter
             'epsilon': trial.suggest_float('epsilon', 1e-5, 1.0, log=True),  # Epsilon in the epsilon-SVR model
-            'kernel': trial.suggest_categorical('kernel', 'rbf'),  # Kernel type
+            'kernel': trial.suggest_categorical('kernel', ['rbf']),  # Kernel type
             'tol': trial.suggest_float('tol', 1e-5, 1e-1, log=True),  # Tolerance for stopping criterion
             'max_iter': trial.suggest_int('max_iter', -1, 1000),  # Max iterations
         }
