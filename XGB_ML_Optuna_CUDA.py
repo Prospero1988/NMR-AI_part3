@@ -65,7 +65,9 @@ def check_input_directory(input_directory):
 
 def load_data(file_path):
     data = pd.read_csv(file_path)
-    return cp.asarray(data.values)  # Keep data as CuPy array
+    # Drop the non-numeric column
+    data = data.iloc[:, 1:]  # Exclude MOLECULE_NAME
+    return cp.asarray(data.values)  # Convert remaining data to CuPy array
 
 def log_search_space():
     search_space = {
@@ -207,7 +209,7 @@ def optimize_hyperparameters(X, y, logger, csv_file):
     optuna.logging.set_verbosity(optuna.logging.WARNING)  # Suppress Optuna logs
 
     # Set n_jobs=1 to avoid GPU conflicts
-    study.optimize(objective, n_trials=3000, n_jobs=1)
+    study.optimize(objective, n_trials=1000, n_jobs=-1)
 
     # After optimization, get gpu_id from the best trial
     best_trial_number = study.best_trial.number
@@ -372,8 +374,8 @@ def process_file(csv_file, input_directory):
     try:
         data = load_data(os.path.join(input_directory, csv_file))
 
-        y = data[:, 1]
-        X = data[:, 2:]
+        y = data[:, 0]
+        X = data[:, 1:]
 
         # Start parent MLflow run
         with mlflow.start_run(run_name=f"Run_{csv_file}"):
