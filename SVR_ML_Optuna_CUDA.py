@@ -75,14 +75,14 @@ def load_data(file_path):
 def log_search_space():
     search_space = {
         'C': ('float', 1e-5, 100.0, 'log'),  # Regularization parameter. Inverse of regularization strength.
-        'epsilon': ('float', 1e-5, 1.0, 'log'),  # Epsilon in the epsilon-SVR model.
+        'epsilon': ('float', 1e-7, 1.0, 'log'),  # Epsilon in the epsilon-SVR model.
  #      'kernel': ('categorical', ['linear', 'poly', 'rbf', 'sigmoid']),  # Specifies the kernel type.
         'kernel': ('categorical', ['rbf']),  # Specifies the kernel type.
         'degree': ('int', 2, 5),  # Degree of the polynomial kernel function ('poly'). Ignored by other kernels.
         'gamma': ('categorical', ['scale', 'auto']),  # Kernel coefficient for 'rbf', 'poly', and 'sigmoid'.
         'coef0': ('float', 0.0, 1.0),  # Independent term in kernel function. Only for 'poly' and 'sigmoid'.
         'tol': ('float', 1e-5, 1e-1, 'log'),  # Tolerance for stopping criterion.
-        'max_iter': ('int', -1, 1000),  # Limit on iterations within solver, or -1 for no limit.
+        'max_iter': ('int', -1, 2000),  # Limit on iterations within solver, or -1 for no limit.
     }
     mlflow.log_dict(search_space, 'hyperparameter_search_space.json')
 
@@ -117,7 +117,7 @@ def optimize_hyperparameters(X, y, logger, csv_file):
 
         params = {
             'C': trial.suggest_float('C', 1e-5, 100.0, log=True),  # Regularization parameter
-            'epsilon': trial.suggest_float('epsilon', 1e-5, 1.0, log=True),  # Epsilon in the epsilon-SVR model
+            'epsilon': trial.suggest_float('epsilon', 1e-7, 1.0, log=True),  # Epsilon in the epsilon-SVR model
             'kernel': trial.suggest_categorical('kernel', ['rbf']),  # Kernel type
             'tol': trial.suggest_float('tol', 1e-5, 1e-1, log=True),  # Tolerance for stopping criterion
             'max_iter': trial.suggest_int('max_iter', -1, 1000),  # Max iterations
