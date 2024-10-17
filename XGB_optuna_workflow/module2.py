@@ -15,6 +15,8 @@ import json
 import joblib
 from mlflow.models.signature import infer_signature
 import warnings
+import tags_config
+
 
 # Suppress the MLflow integer column warning
 warnings.filterwarnings("ignore", message=".*integer column.*", category=UserWarning)
@@ -135,7 +137,11 @@ def process_file(csv_file, input_directory):
 
         run_name = f"Training_{csv_file}_{int(time.time())}"
         with mlflow.start_run(run_name=run_name):
-            mlflow.set_tag('stage', 'training')
+            
+            # Set tags from the external file
+            for tag_name, tag_value in tags_config.mlflow_tags2.items():
+                mlflow.set_tag(tag_name, tag_value)
+    
             model, evals_result = train_final_model(X, y, best_params, num_boost_round)
             metrics, per_instance_data = evaluate_model(model, X, y)
 

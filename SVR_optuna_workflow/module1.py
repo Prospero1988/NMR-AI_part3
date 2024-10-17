@@ -16,6 +16,7 @@ import subprocess
 from logging.handlers import RotatingFileHandler
 from cuml.svm import SVR
 from sklearn.model_selection import KFold
+import tags_config
 
 # Initialize basic logging
 logging.basicConfig(level=logging.INFO)
@@ -230,9 +231,10 @@ def process_file(csv_file, input_directory):
 
         # Start MLflow run
         with mlflow.start_run(run_name=f"Optimization_{csv_file}_{int(time.time())}"):
-            # Add custom tags
-            mlflow.set_tag('author', 'aleniak')
-            mlflow.set_tag('module', 'Hyperparameter Optimization')
+            
+            # Set tags from the external file
+            for tag_name, tag_value in tags_config.mlflow_tags1.items():
+                mlflow.set_tag(tag_name, tag_value)
 
             # Log environment
             log_environment()

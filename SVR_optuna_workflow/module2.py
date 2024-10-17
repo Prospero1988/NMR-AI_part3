@@ -17,6 +17,7 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from scipy.stats import pearsonr
 from mlflow.models.signature import infer_signature
 import warnings
+import tags_config
 
 # Suppress the MLflow integer column warning
 warnings.filterwarnings("ignore", message=".*integer column.*", category=UserWarning)
@@ -171,9 +172,10 @@ def process_file(csv_file, input_directory):
 
         # Start MLflow run
         with mlflow.start_run(run_name=f"Training_{csv_file}_{int(time.time())}"):
-            # Add custom tags
-            mlflow.set_tag('author', 'aleniak')
-            mlflow.set_tag('module', 'Model Training')
+
+            # Set tags from the external file
+            for tag_name, tag_value in tags_config.mlflow_tags2.items():
+                mlflow.set_tag(tag_name, tag_value)
 
             # Log environment
             log_environment()

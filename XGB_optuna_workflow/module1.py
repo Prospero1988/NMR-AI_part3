@@ -17,6 +17,7 @@ import argparse
 import subprocess
 import time
 import json
+import tags_config
 
 def setup_logging(logger_name, log_file):
     # Initialize and configure logging
@@ -159,7 +160,11 @@ def process_file(csv_file, input_directory):
 
         run_name = f"Optimization_{csv_file}_{int(time.time())}"
         with mlflow.start_run(run_name=run_name):
-            mlflow.set_tag('stage', 'hyperparameter_optimization')
+            
+            # Set tags from the external file
+            for tag_name, tag_value in tags_config.mlflow_tags1.items():
+                mlflow.set_tag(tag_name, tag_value)
+            
             log_environment()
             best_params, num_boost_round = optimize_hyperparameters(X, y, logger, csv_file)
             best_params['num_boost_round'] = num_boost_round
