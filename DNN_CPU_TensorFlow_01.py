@@ -43,16 +43,16 @@ def create_model(trial, input_shape):
     activation = trial.suggest_categorical('activation', ['relu', 'tanh'])
 
     # Preprocessing layers
-    model.add(layers.Dense(256, activation=activation))
+    model.add(layers.Dense(250, activation=activation))
     model.add(layers.Dropout(trial.suggest_float('dropout_rate_1', 0.0, 0.5)))
-    model.add(layers.Dense(256, activation=activation))
+    model.add(layers.Dense(125, activation=activation))
     model.add(layers.Dropout(trial.suggest_float('dropout_rate_2', 0.0, 0.5)))
 
     # Hidden layers
-    model.add(layers.Dense(128, activation=activation))
-    model.add(layers.Dense(64, activation=activation))
-    model.add(layers.Dense(32, activation=activation))
-    model.add(layers.Dense(16, activation=activation))
+    model.add(layers.Dense(125, activation=activation))
+    model.add(layers.Dense(125, activation=activation))
+    model.add(layers.Dense(125, activation=activation))
+    model.add(layers.Dense(125, activation=activation))
 
     # Output layer
     model.add(layers.Dense(1))
@@ -126,14 +126,14 @@ if __name__ == '__main__':
             model.add(layers.InputLayer(input_shape=input_shape))
             activation = trial.params['activation']
 
-            model.add(layers.Dense(256, activation=activation))
+            model.add(layers.Dense(250, activation=activation))
             model.add(layers.Dropout(trial.params['dropout_rate_1']))
-            model.add(layers.Dense(256, activation=activation))
+            model.add(layers.Dense(125, activation=activation))
             model.add(layers.Dropout(trial.params['dropout_rate_2']))
-            model.add(layers.Dense(128, activation=activation))
-            model.add(layers.Dense(64, activation=activation))
-            model.add(layers.Dense(32, activation=activation))
-            model.add(layers.Dense(16, activation=activation))
+            model.add(layers.Dense(125, activation=activation))
+            model.add(layers.Dense(125, activation=activation))
+            model.add(layers.Dense(125, activation=activation))
+            model.add(layers.Dense(125, activation=activation))
             model.add(layers.Dense(1))
             model.compile(optimizer=get_optimizer(trial.params['optimizer'], trial.params['learning_rate']), loss='mean_squared_error')
 
@@ -159,14 +159,14 @@ if __name__ == '__main__':
         final_model.add(layers.InputLayer(input_shape=input_shape))
         activation = trial.params['activation']
 
-        final_model.add(layers.Dense(256, activation=activation))
+        final_model.add(layers.Dense(250, activation=activation))
         final_model.add(layers.Dropout(trial.params['dropout_rate_1']))
-        final_model.add(layers.Dense(256, activation=activation))
+        final_model.add(layers.Dense(125, activation=activation))
         final_model.add(layers.Dropout(trial.params['dropout_rate_2']))
-        final_model.add(layers.Dense(128, activation=activation))
-        final_model.add(layers.Dense(64, activation=activation))
-        final_model.add(layers.Dense(32, activation=activation))
-        final_model.add(layers.Dense(16, activation=activation))
+        final_model.add(layers.Dense(125, activation=activation))
+        final_model.add(layers.Dense(125, activation=activation))
+        final_model.add(layers.Dense(125, activation=activation))
+        final_model.add(layers.Dense(125, activation=activation))
         final_model.add(layers.Dense(1))
         final_model.compile(optimizer=get_optimizer(trial.params['optimizer'], trial.params['learning_rate']), loss='mean_squared_error')
 
