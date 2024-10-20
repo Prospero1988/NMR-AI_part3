@@ -16,7 +16,7 @@ import joblib
 from mlflow.models.signature import infer_signature
 import warnings
 import tags_config
-
+import matplotlib.pyplot as plt  # Import matplotlib for plotting
 
 # Suppress the MLflow integer column warning
 warnings.filterwarnings("ignore", message=".*integer column.*", category=UserWarning)
@@ -101,7 +101,7 @@ def evaluate_model(model, X, y):
         'Pearson': pearson_corr,
     }
 
-    return metrics, per_instance_data
+    return metrics, per_instance_data, y_pred
 
 def save_metrics_and_params(metrics, params, file_name, logger):
     with open(file_name, 'w', encoding='utf-8') as f:
@@ -143,7 +143,9 @@ def process_file(csv_file, input_directory):
                 mlflow.set_tag(tag_name, tag_value)
     
             model, evals_result = train_final_model(X, y, best_params, num_boost_round)
-            metrics, per_instance_data = evaluate_model(model, X, y)
+            metrics, per_instance_data, y_pred = evaluate_model(model, X, y)
+
+            generate_and_log_plots(y, y_pred, csv_file)
 
             # Log metrics to MLflow
             mlflow.log_metrics(metrics)
@@ -160,7 +162,7 @@ def process_file(csv_file, input_directory):
 
             # Save the model to MLflow
             input_example = pd.DataFrame(X[:5])
-            signature = infer_signature(input_example, model.predict(xgb.DMatrix(X[:5])))
+            signature = infer_signature(input_example, y_pred[:5])
             mlflow.xgboost.log_model(
                 model,
                 artifact_path="model",
@@ -190,6 +192,35 @@ def main():
     csv_files = check_input_directory(input_directory)
     for csv_file in csv_files:
         process_file(csv_file, input_directory)
+
+def generate_and_log_plots(y_true, y_pred, csv_file):
+    # Plot Actual vs Predicted
+    plt.figure(figsize=(8, 6))
+    plt.scatter(y_true, y_pred, alpha=0.7)
+    plt.xlabel('Actual Values')
+    plt.ylabel('Predicted Values')
+    plt.title('Actual vs Predicted Values')
+    plt.plot([y_true.min(), y_true.max()], [y_true.min(), y_true.max()], 'r--')
+    plt.tight_layout()
+    actual_vs_predicted_plot = f"{os.path.splitext(csv_file)[0]}_actual_vs_predicted.png"
+    plt.savefig(actual_vs_predicted_plot)
+    mlflow.log_artifact(actual_vs_predicted_plot)
+    plt.close()
+
+    # Plot Residuals
+    residuals = y_true - y_pred
+    plt.figure(figsize=(8, 6))
+    plt.scatter(y_pred, residuals, alpha=0.7)
+    plt.xlabel('Predicted Values')
+    plt.ylabel('Residuals')
+    plt.title('Residuals vs Predicted Values')
+    plt.axhline(0, color='r', linestyle='--')
+    plt.tight_layout()
+    residuals_plot = f"{os.path.splitext(csv_file)[0]}_residuals.png"
+    plt.savefig(residuals_plot)
+    mlflow.log_artifact(residuals_plot)
+    plt.close()
+
 
 if __name__ == "__main__":
     main()

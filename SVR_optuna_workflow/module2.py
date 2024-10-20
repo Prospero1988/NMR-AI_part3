@@ -18,6 +18,8 @@ from scipy.stats import pearsonr
 from mlflow.models.signature import infer_signature
 import warnings
 import tags_config
+import matplotlib.pyplot as plt  # Import matplotlib for plotting
+
 
 # Suppress the MLflow integer column warning
 warnings.filterwarnings("ignore", message=".*integer column.*", category=UserWarning)
@@ -109,7 +111,7 @@ def evaluate_model(model, X, y):
     })
 
     # Overall metrics
-    rmse = np.sqrt(mean_squared_error(y, y_pred))
+    rmse = mean_squared_error(y, y_pred, squared=False)
     mae = mean_absolute_error(y, y_pred)
     mae_std = np.std(abs_error)
 
@@ -193,6 +195,8 @@ def process_file(csv_file, input_directory):
             # Evaluate the model
             metrics, per_instance_data = evaluate_model(model, X, y)
 
+            generate_and_log_plots(y, model.predict(X), csv_file)
+
             # Log metrics
             mlflow.log_metrics(metrics)
 
@@ -217,8 +221,8 @@ def process_file(csv_file, input_directory):
             mlflow.sklearn.log_model(
                 sk_model=model,
                 artifact_path="model",
-                signature=infer_signature(X, model.predict(X)),
-                input_example=X.head(5)
+                signature=signature,
+                input_example=input_example
             )
 
             # Save metrics and parameters
@@ -227,10 +231,11 @@ def process_file(csv_file, input_directory):
             mlflow.log_artifact(metrics_file_name)
 
             logger.info(
-                f"Metrics for {csv_file}: RMSE: {metrics['RMSE']:.4f}, "
-                f"R2: {metrics['R2']:.4f}, Pearson: {metrics['Pearson']:.4f}"
-                f"MAE: {metrics['MAE']:.4f}, MAE StDev: {metrics['MAE StDev']:.4f}"
-            )
+                        f"Metrics for {csv_file}: RMSE: {metrics['RMSE']:.4f}, "
+                        f"R2: {metrics['R2']:.4f}, Pearson: {metrics['Pearson']:.4f}, "
+                        f"MAE: {metrics['MAE']:.4f}, MAE StDev: {metrics['MAE StDev']:.4f}"
+                    )
+
             logger.info(f"Finished training for {csv_file}")
 
     except Exception as e:
@@ -279,6 +284,35 @@ def log_environment():
             mlflow.log_artifact(pip_req_file)
         except Exception as e:
             logging.warning(f"Could not log pip requirements: {e}")
+
+def generate_and_log_plots(y_true, y_pred, csv_file):
+    # Plot Actual vs Predicted
+    plt.figure(figsize=(8, 6))
+    plt.scatter(y_true, y_pred, alpha=0.7)
+    plt.xlabel('Actual Values')
+    plt.ylabel('Predicted Values')
+    plt.title('Actual vs Predicted Values')
+    plt.plot([y_true.min(), y_true.max()], [y_true.min(), y_true.max()], 'r--')
+    plt.tight_layout()
+    actual_vs_predicted_plot = f"{os.path.splitext(csv_file)[0]}_actual_vs_predicted.png"
+    plt.savefig(actual_vs_predicted_plot)
+    mlflow.log_artifact(actual_vs_predicted_plot)
+    plt.close()
+
+    # Plot Residuals
+    residuals = y_true - y_pred
+    plt.figure(figsize=(8, 6))
+    plt.scatter(y_pred, residuals, alpha=0.7)
+    plt.xlabel('Predicted Values')
+    plt.ylabel('Residuals')
+    plt.title('Residuals vs Predicted Values')
+    plt.axhline(0, color='r', linestyle='--')
+    plt.tight_layout()
+    residuals_plot = f"{os.path.splitext(csv_file)[0]}_residuals.png"
+    plt.savefig(residuals_plot)
+    mlflow.log_artifact(residuals_plot)
+    plt.close()
+
 
 if __name__ == "__main__":
     main()

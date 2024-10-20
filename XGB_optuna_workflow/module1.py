@@ -1,12 +1,9 @@
 # hyperparameter_optimization.py
 
-import warnings
 import os
 import pandas as pd
 import xgboost as xgb
 import cupy as cp
-import numpy as np
-import joblib
 import sys
 import logging
 from logging.handlers import RotatingFileHandler
@@ -18,6 +15,8 @@ import subprocess
 import time
 import json
 import tags_config
+import matplotlib.pyplot as plt
+import optuna.visualization.matplotlib as optuna_visualization
 
 def setup_logging(logger_name, log_file):
     # Initialize and configure logging
@@ -55,7 +54,7 @@ def load_data(file_path):
 
 def log_search_space():
     search_space = {
-        'max_depth': ('int', 1, 20),
+        'max_depth': ('int', 1, 30),
         'learning_rate': ('float', 1e-5, 0.5, 'log'),
         'subsample': ('float', 0.1, 1.0),
         'colsample_bytree': ('float', 0.1, 1.0),
@@ -149,7 +148,7 @@ def optimize_hyperparameters(X, y, logger, csv_file):
 
     mlflow.log_params(best_params)
     mlflow.log_metric('num_boost_round', num_boost_round)
-    return best_params, num_boost_round
+    return best_params, num_boost_round, study
 
 def process_file(csv_file, input_directory):
     try:
@@ -166,7 +165,7 @@ def process_file(csv_file, input_directory):
                 mlflow.set_tag(tag_name, tag_value)
             
             log_environment()
-            best_params, num_boost_round = optimize_hyperparameters(X, y, logger, csv_file)
+            best_params, num_boost_round, study = optimize_hyperparameters(X, y, logger, csv_file)
             best_params['num_boost_round'] = num_boost_round
 
             # Save best_params to JSON
@@ -174,6 +173,17 @@ def process_file(csv_file, input_directory):
             with open(best_params_file, 'w') as f:
                 json.dump(best_params, f)
             mlflow.log_artifact(best_params_file)
+
+            fig = optuna_visualization.plot_param_importances(study)
+            fig_name = f"hyperparameter_importance_{os.path.splitext(csv_file)[0]}.png"
+
+            # Retrieve the Figure object from the Axes
+            figure = fig.get_figure()
+            figure.savefig(fig_name)
+            mlflow.log_artifact(fig_name)
+            plt.close(figure)
+
+
     except Exception as e:
         logging.error(f"Error processing {csv_file}: {e}", exc_info=True)
         mlflow.log_param('Exception', str(e))

@@ -1,5 +1,3 @@
-# module1.py
-
 import setuptools  # Ensure setuptools is imported first
 import time
 import os
@@ -8,7 +6,6 @@ import argparse
 import logging
 import pandas as pd
 import cupy as cp
-import joblib
 import optuna
 import mlflow
 import json
@@ -17,6 +14,8 @@ from logging.handlers import RotatingFileHandler
 from cuml.svm import SVR
 from sklearn.model_selection import KFold
 import tags_config
+import matplotlib.pyplot as plt
+import optuna.visualization.matplotlib as optuna_visualization
 
 # Initialize basic logging
 logging.basicConfig(level=logging.INFO)
@@ -87,11 +86,13 @@ def load_data(file_path):
 
 def log_search_space():
     search_space = {
-        'C': ('float', 1e-5, 100.0, 'log'),  # Regularization parameter
-        'epsilon': ('float', 1e-7, 1.0, 'log'),  # Epsilon in the epsilon-SVR model
-        'kernel': ('categorical', ['rbf']),  # Kernel type
-        'tol': ('float', 1e-5, 1e-1, 'log'),  # Tolerance for stopping criterion
+        'C': ('float', 1e-5, 1e6, 'log'),  # Rozszerzony zakres C
+        'epsilon': ('float', 1e-7, 10.0, 'log'),  # Rozszerzony zakres epsilon
+        'kernel': ('categorical', ['rbf']),  # Kernel pozostaje 'rbf'
+        'tol': ('float', 1e-6, 1e-1, 'log'),  # Rozszerzony zakres tol
         'max_iter': ('int', -1),  # Max iterations
+        'gamma_type': ('categorical', ['scale', 'auto', 'float']),
+        'gamma': ('float', 1e-9, 1e3, 'log'),  # Rozszerzony zakres gamma
     }
     mlflow.log_dict(search_space, 'hyperparameter_search_space.json')
 
@@ -160,17 +161,6 @@ def optimize_hyperparameters(X, y, logger, csv_file):
         # Log RMSE
         mlflow.log_metric('rmse', mean_rmse, step=trial.number)
 
-        # Collect trial data
-        trial_data = {
-            'trial_number': trial.number,
-            'rmse': mean_rmse,
-        }
-        trial_data.update(params)
-        trial_data['gamma_type'] = gamma_type  # Add gamma_type to trial data
-
-        # Append trial data to the list
-        optimize_hyperparameters.trial_data_list.append(trial_data)
-
         return mean_rmse  # Optimize based on RMSE
 
     try:
@@ -211,12 +201,12 @@ def optimize_hyperparameters(X, y, logger, csv_file):
         mlflow.log_artifact(best_params_file)
 
         # Save trial data to CSV and log as artifact
-        trial_data_df = pd.DataFrame(optimize_hyperparameters.trial_data_list)
+        trials_df = study.trials_dataframe()
         trial_data_csv = f"{os.path.splitext(csv_file)[0]}_trial_data.csv"
-        trial_data_df.to_csv(trial_data_csv, index=False)
+        trials_df.to_csv(trial_data_csv, index=False)
         mlflow.log_artifact(trial_data_csv)
 
-        return best_params
+        return best_params, study
 
     except Exception as e:
         logger.error(f"Error during optimization: {e}", exc_info=True)
@@ -231,7 +221,7 @@ def process_file(csv_file, input_directory):
 
         # Start MLflow run
         with mlflow.start_run(run_name=f"Optimization_{csv_file}_{int(time.time())}"):
-            
+
             # Set tags from the external file
             for tag_name, tag_value in tags_config.mlflow_tags1.items():
                 mlflow.set_tag(tag_name, tag_value)
@@ -244,8 +234,18 @@ def process_file(csv_file, input_directory):
             logger.info(f"Starting optimization for {csv_file}")
 
             # Hyperparameter optimization
-            best_params = optimize_hyperparameters(X, y, logger, csv_file)
+            best_params, study = optimize_hyperparameters(X, y, logger, csv_file)
             logger.info(f"Finished optimization for {csv_file}")
+
+            fig = optuna_visualization.plot_param_importances(study)
+            fig_name = f'hyperparameter_importance_{os.path.splitext(csv_file)[0]}.png'
+
+            # Retrieve the Figure object from the Axes
+            figure = fig.get_figure()
+            figure.savefig(fig_name)
+            mlflow.log_artifact(fig_name)
+            plt.close(figure)
+
 
     except Exception as e:
         logging.error(f"Error processing {csv_file}: {e}", exc_info=True)
