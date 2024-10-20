@@ -172,7 +172,7 @@ def objective(trial, csv_path):
         y_train = torch.tensor(y_train, dtype=torch.float32)
 
         # Sugestia batch_size i epochs
-        batch_size = trial.suggest_int('batch_size', 16, 128, log=True)
+        batch_size = trial.suggest_int('batch_size', 8, 128, log=True)
         epochs = trial.suggest_int('epochs', 50, 500, step=50)
 
         # Walidacja krzyżowa KFold na zbiorze treningowym
@@ -324,7 +324,7 @@ def train_final_model(csv_path, trial):
             scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5)
 
         dataset = torch.utils.data.TensorDataset(X_train, y_train)
-        loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
 
         for epoch in range(epochs):
             model.train()
@@ -445,7 +445,8 @@ if __name__ == '__main__':
 
                 study = optuna.create_study(direction='minimize')
                 study.optimize(objective_wrapper, n_trials=300)
-
+                torch.cuda.empty_cache()
+                
                 # Logowanie najlepszych parametrów
                 trial = study.best_trial
                 mlflow.log_param("best_value", trial.value)

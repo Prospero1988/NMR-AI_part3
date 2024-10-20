@@ -431,7 +431,7 @@ if __name__ == '__main__':
 
             # Optymalizacja z użyciem mlflow_callback
             study = optuna.create_study(direction='minimize')
-            study.optimize(objective_wrapper, n_trials=20, callbacks=[mlflow_callback])
+            study.optimize(objective_wrapper, n_trials=300, callbacks=[mlflow_callback])
 
             # Logowanie najlepszych parametrów i metryk
             trial = study.best_trial
