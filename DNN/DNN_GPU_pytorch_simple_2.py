@@ -444,7 +444,7 @@ if __name__ == '__main__':
                     return objective(trial, csv_path)
 
                 study = optuna.create_study(direction='minimize')
-                study.optimize(objective_wrapper, n_trials=50)
+                study.optimize(objective_wrapper, n_trials=300)
 
                 # Logowanie najlepszych parametrów
                 trial = study.best_trial
