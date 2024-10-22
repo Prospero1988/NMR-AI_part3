@@ -564,7 +564,7 @@ if __name__ == '__main__':
                     return objective(trial, csv_path)
 
                 study = optuna.create_study(direction='minimize')
-                study.optimize(objective_wrapper, n_trials=1000)  # Zwiększono liczbę prób
+                study.optimize(objective_wrapper, n_trials=2000)  # Zwiększono liczbę prób
 
                 torch.cuda.empty_cache()
 

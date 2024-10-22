@@ -13,7 +13,7 @@ def main():
     experiment_name = args.experiment_name
 
     # Call module1.py
-    subprocess.run(['python', 'module1.py', input_directory, '--experiment_name', experiment_name])
+    #subprocess.run(['python', 'module1.py', input_directory, '--experiment_name', experiment_name])
 
     # Call module2.py
     subprocess.run(['python', 'module2.py', input_directory, '--experiment_name', experiment_name])

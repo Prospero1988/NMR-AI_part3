@@ -2,21 +2,19 @@
 
 mlflow_tags1 = {
     "architecture": "Pytorch",
-    "type": "MLP",
-    "model": "DNN",
+    "model": "MLP",
     "stage": "Optuna HP",
     "author": "aleniak",
-    "opt trials": "1000",
+    "opt trials": "2000",
     "property": "CHIlogD"
 }
 
 mlflow_tags2 = {
     "architecture": "Pytorch",
-    "type": "MLP",
     "predictor": "13C",
-    "model": "DNN",
+    "model": "DMLP",
     "stage": "training",
     "author": "aleniak",
-    "opt trials": "1000",
+    "opt trials": "2000",
     "property": "CHIlogD"
 }

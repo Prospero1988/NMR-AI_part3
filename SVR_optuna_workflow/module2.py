@@ -19,7 +19,7 @@ from mlflow.models.signature import infer_signature
 import warnings
 import tags_config
 import matplotlib.pyplot as plt  # Import matplotlib for plotting
-
+from sklearn.model_selection import KFold  # Import KFold for cross-validation
 
 # Suppress the MLflow integer column warning
 warnings.filterwarnings("ignore", message=".*integer column.*", category=UserWarning)
@@ -31,7 +31,7 @@ warnings.filterwarnings("ignore", message="Setuptools is replacing distutils")
 logging.basicConfig(level=logging.INFO)
 
 def main():
-    parser = argparse.ArgumentParser(description='SVR Model Training with MLflow')
+    parser = argparse.ArgumentParser(description='SVR Model Training with MLflow and 10-fold Cross-Validation')
     parser.add_argument('input_directory', type=str, help='Path to the input directory containing CSV files')
     parser.add_argument('--experiment_name', type=str, default='Default', help='Name of the MLflow experiment')
     args = parser.parse_args()
@@ -137,18 +137,25 @@ def save_model(model, file_name, logger):
     joblib.dump(model, file_name)
     logger.info(f"Model saved to {file_name}")
 
-def save_metrics_and_params(metrics, params, file_name, logger):
+def save_metrics_and_params(avg_metrics, params, file_name, logger, fold_metrics_list=None, final_metrics=None):
     with open(file_name, 'w', encoding='utf-8') as f:
-        f.write(f"Model Status: Trained new model\n\n")
+        f.write(f"Model Status: Trained new model with 10-fold Cross-Validation\n\n")
         f.write("Hyperparameters:\n")
         for param, value in params.items():
             f.write(f"{param}: {value}\n")
-        f.write("\nMetrics:\n")
-        f.write(f"RMSE: {metrics['RMSE']:.4f}\n")
-        f.write(f"MAE: {metrics['MAE']:.4f}\n")
-        f.write(f"MAE Standard Deviation: {metrics['MAE StDev']:.4f}\n")
-        f.write(f"R2: {metrics['R2']:.4f}\n")
-        f.write(f"Pearson Correlation Coefficient: {metrics['Pearson']:.4f}\n")
+        f.write("\nAverage Metrics over folds:\n")
+        for metric_name, metric_value in avg_metrics.items():
+            f.write(f"{metric_name}: {metric_value:.4f}\n")
+        if fold_metrics_list is not None:
+            f.write("\nPer-Fold Metrics:\n")
+            for i, metrics in enumerate(fold_metrics_list, 1):
+                f.write(f"\nFold {i} Metrics:\n")
+                for metric_name, metric_value in metrics.items():
+                    f.write(f"{metric_name}: {metric_value:.4f}\n")
+        if final_metrics is not None:
+            f.write("\nMetrics for Final Model Trained on Full Data:\n")
+            for metric_name, metric_value in final_metrics.items():
+                f.write(f"{metric_name}: {metric_value:.4f}\n")
     logger.info(f"Metrics and hyperparameters saved to {file_name}")
 
 def process_file(csv_file, input_directory):
@@ -157,8 +164,8 @@ def process_file(csv_file, input_directory):
 
         # Ensure data is a pandas DataFrame with proper columns
         # Assuming the target variable is in the first column after MOLECULE_NAME
-        y = data.iloc[:, 0]
-        X = data.iloc[:, 1:]
+        y = data.iloc[:, 0].values
+        X = data.iloc[:, 1:].values
 
         # Load best hyperparameters from JSON file
         best_params_file = f"best_hyperparameters_{os.path.splitext(csv_file)[0]}.json"
@@ -174,7 +181,6 @@ def process_file(csv_file, input_directory):
 
         # Start MLflow run
         with mlflow.start_run(run_name=f"Training_{csv_file}_{int(time.time())}"):
-
             # Set tags from the external file
             for tag_name, tag_value in tags_config.mlflow_tags2.items():
                 mlflow.set_tag(tag_name, tag_value)
@@ -189,37 +195,84 @@ def process_file(csv_file, input_directory):
             # Log best hyperparameters
             mlflow.log_params(best_params)
 
-            # Train the model
-            model = train_final_model(X, y, best_params)
+            # Set up KFold cross-validation
+            kf = KFold(n_splits=10, shuffle=True, random_state=42)
+            fold_metrics_list = []
+            per_instance_data_list = []
+            y_pred_all = np.zeros_like(y)
+            fold = 1
 
-            # Evaluate the model
-            metrics, per_instance_data = evaluate_model(model, X, y)
+            for train_index, val_index in kf.split(X):
+                X_train, X_val = X[train_index], X[val_index]
+                y_train, y_val = y[train_index], y[val_index]
 
-            generate_and_log_plots(y, model.predict(X), csv_file)
+                # Train the model on the training set
+                model = train_final_model(X_train, y_train, best_params)
 
-            # Log metrics
-            mlflow.log_metrics(metrics)
+                # Evaluate the model on the validation set
+                metrics, per_instance_data = evaluate_model(model, X_val, y_val)
+
+                # Update the overall predictions
+                y_pred_all[val_index] = model.predict(X_val)
+
+                # Append per-instance data
+                per_instance_data_list.append(per_instance_data)
+
+                # Log per-fold metrics
+                logger.info(f"Fold {fold} metrics: {metrics}")
+                mlflow.log_metrics({f'Fold_{fold}_{k}': v for k, v in metrics.items()})
+                fold_metrics_list.append(metrics)
+
+                fold += 1
+
+            # Compute average metrics over folds
+            avg_metrics = {}
+            for key in fold_metrics_list[0]:
+                avg_metrics[key] = np.mean([m[key] for m in fold_metrics_list])
+
+            # Combine per-instance data
+            per_instance_data = pd.concat(per_instance_data_list, ignore_index=True)
+
+            # Generate and log plots for cross-validation predictions
+            generate_and_log_plots(y, y_pred_all, csv_file, suffix='_cv')
+
+            # Log average metrics to MLflow
+            mlflow.log_metrics(avg_metrics)
 
             # Save per-instance data
             per_instance_data_file = f"{os.path.splitext(csv_file)[0]}_per_instance_data.csv"
             per_instance_data.to_csv(per_instance_data_file, index=False)
             mlflow.log_artifact(per_instance_data_file)
 
-            # Save the model as a pickle file and log as artifact
+            # Train final model on the full dataset
+            final_model = train_final_model(X, y, best_params)
+
+            # Evaluate final model
+            final_metrics, final_per_instance_data = evaluate_model(final_model, X, y)
+
+            # Generate and log plots for final model predictions
+            y_pred_final = final_model.predict(X)
+            generate_and_log_plots(y, y_pred_final, csv_file, suffix='_final')
+
+            # Log final model metrics
+            mlflow.log_metrics({f'Final_{k}': v for k, v in final_metrics.items()})
+
+            # Save the final model trained on the full data
             model_file_name = f"{os.path.splitext(csv_file)[0]}_trained_model.pkl"
-            save_model(model, model_file_name, logger)
+            save_model(final_model, model_file_name, logger)
             mlflow.log_artifact(model_file_name)
 
             # Log the model to MLflow in standard format with signature and input example
-            input_example = X.head(5)
-            signature = infer_signature(input_example, model.predict(input_example))
+            input_example = pd.DataFrame(X[:5])
+            signature = infer_signature(input_example, final_model.predict(X[:5]))
 
             # Convert integer columns to float64 to handle potential missing values in the future
-            X = X.astype({col: 'float64' for col in X.select_dtypes('int').columns})
-            
+            X_df = pd.DataFrame(X)
+            X_df = X_df.astype({col: 'float64' for col in X_df.select_dtypes('int').columns})
+
             # Now log the model with the updated data types
             mlflow.sklearn.log_model(
-                sk_model=model,
+                sk_model=final_model,
                 artifact_path="model",
                 signature=signature,
                 input_example=input_example
@@ -227,14 +280,20 @@ def process_file(csv_file, input_directory):
 
             # Save metrics and parameters
             metrics_file_name = f"{os.path.splitext(csv_file)[0]}_trained_metrics_and_params.txt"
-            save_metrics_and_params(metrics, best_params, metrics_file_name, logger)
+            save_metrics_and_params(avg_metrics, best_params, metrics_file_name, logger, fold_metrics_list, final_metrics)
             mlflow.log_artifact(metrics_file_name)
 
             logger.info(
-                        f"Metrics for {csv_file}: RMSE: {metrics['RMSE']:.4f}, "
-                        f"R2: {metrics['R2']:.4f}, Pearson: {metrics['Pearson']:.4f}, "
-                        f"MAE: {metrics['MAE']:.4f}, MAE StDev: {metrics['MAE StDev']:.4f}"
-                    )
+                f"Average Metrics for {csv_file}: RMSE: {avg_metrics['RMSE']:.4f}, "
+                f"R2: {avg_metrics['R2']:.4f}, Pearson: {avg_metrics['Pearson']:.4f}, "
+                f"MAE: {avg_metrics['MAE']:.4f}, MAE StDev: {avg_metrics['MAE StDev']:.4f}"
+            )
+
+            logger.info(
+                f"Final Model Metrics for {csv_file}: RMSE: {final_metrics['RMSE']:.4f}, "
+                f"R2: {final_metrics['R2']:.4f}, Pearson: {final_metrics['Pearson']:.4f}, "
+                f"MAE: {final_metrics['MAE']:.4f}, MAE StDev: {final_metrics['MAE StDev']:.4f}"
+            )
 
             logger.info(f"Finished training for {csv_file}")
 
@@ -285,16 +344,16 @@ def log_environment():
         except Exception as e:
             logging.warning(f"Could not log pip requirements: {e}")
 
-def generate_and_log_plots(y_true, y_pred, csv_file):
+def generate_and_log_plots(y_true, y_pred, csv_file, suffix=''):
     # Plot Actual vs Predicted
     plt.figure(figsize=(8, 6))
     plt.scatter(y_true, y_pred, alpha=0.7)
     plt.xlabel('Actual Values')
     plt.ylabel('Predicted Values')
-    plt.title('Actual vs Predicted Values')
+    plt.title(f'Actual vs Predicted Values{suffix}')
     plt.plot([y_true.min(), y_true.max()], [y_true.min(), y_true.max()], 'r--')
     plt.tight_layout()
-    actual_vs_predicted_plot = f"{os.path.splitext(csv_file)[0]}_actual_vs_predicted.png"
+    actual_vs_predicted_plot = f"{os.path.splitext(csv_file)[0]}_actual_vs_predicted{suffix}.png"
     plt.savefig(actual_vs_predicted_plot)
     mlflow.log_artifact(actual_vs_predicted_plot)
     plt.close()
@@ -305,10 +364,10 @@ def generate_and_log_plots(y_true, y_pred, csv_file):
     plt.scatter(y_pred, residuals, alpha=0.7)
     plt.xlabel('Predicted Values')
     plt.ylabel('Residuals')
-    plt.title('Residuals vs Predicted Values')
+    plt.title(f'Residuals vs Predicted Values{suffix}')
     plt.axhline(0, color='r', linestyle='--')
     plt.tight_layout()
-    residuals_plot = f"{os.path.splitext(csv_file)[0]}_residuals.png"
+    residuals_plot = f"{os.path.splitext(csv_file)[0]}_residuals{suffix}.png"
     plt.savefig(residuals_plot)
     mlflow.log_artifact(residuals_plot)
     plt.close()
