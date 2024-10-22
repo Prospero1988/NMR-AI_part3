@@ -28,6 +28,10 @@ import mlflow.keras
 from mlflow.models.signature import infer_signature
 from datetime import datetime
 from optuna.integration.mlflow import MLflowCallback
+import optuna.visualization.matplotlib as optuna_viz
+import matplotlib.pyplot as plt
+import json
+from optuna import importance
 
 # Importowanie tagów MLflow z pliku tags_config.py
 import tags_config_tensor
@@ -259,10 +263,9 @@ def objective(trial, csv_path):
         print(f"Wystąpił błąd w funkcji celu: {e}")
         raise e
 
-
-def train_final_model(csv_path, trial):
+def train_final_model(csv_path, trial, csv_name):
     """
-    Trenuje finalny model z najlepszymi hiperparametrami z Optuna.
+    Trenuje finalny model z najlepszymi hiperparametrami z Optuna z walidacją krzyżową 10CV.
 
     Parametry:
     - csv_path: Ścieżka do pliku CSV.
@@ -270,18 +273,10 @@ def train_final_model(csv_path, trial):
     """
     try:
         # Wczytanie danych
-        X_train_full, y_train_full = load_data(csv_path, target_column_name='LABEL')
-
-        X_train_full = X_train_full.astype(np.float32)
-        y_train_full = y_train_full.astype(np.float32)
-
-        # Podział danych na zbiory treningowy i testowy
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_train_full, y_train_full, test_size=0.1, random_state=SEED
-        )
+        X, y = load_data(csv_path, target_column_name='LABEL')
 
         # Tworzenie modelu z najlepszymi parametrami
-        input_shape = (X_train.shape[1],)
+        input_shape = (X.shape[1],)
         final_model = keras.Sequential()
         final_model.add(layers.InputLayer(shape=input_shape))
         activation = trial.params['activation']
@@ -319,41 +314,70 @@ def train_final_model(csv_path, trial):
         )
         final_model.compile(optimizer=optimizer, loss='mean_squared_error')
 
-        # Trenowanie finalnego modelu na zbiorze treningowym
-        batch_size = 32
-        epochs = 300
-        final_model.fit(
-            X_train,
-            y_train,
-            batch_size=batch_size,
-            epochs=epochs,
-            verbose=0
-        )
+        # 10-krotna walidacja krzyżowa KFold
+        kf = KFold(n_splits=10, shuffle=True, random_state=SEED)
+        rmse_scores = []
+        mae_scores = []
+        r2_scores = []
+        pearson_scores = []
 
-        # Ocena modelu na zbiorze testowym
-        y_test_pred = final_model.predict(X_test).flatten()
-        test_rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
-        test_mae = mean_absolute_error(y_test, y_test_pred)
-        test_r2 = r2_score(y_test, y_test_pred)
-        test_pearson_corr, _ = pearsonr(y_test, y_test_pred)
+        for train_index, valid_index in kf.split(X):
+            X_train_fold, X_valid_fold = X[train_index], X[valid_index]
+            y_train_fold, y_valid_fold = y[train_index], y[valid_index]
 
-        # Logowanie metryk zbioru testowego
-        mlflow.log_metric("Test RMSE", test_rmse)
-        mlflow.log_metric("Test MAE", test_mae)
-        mlflow.log_metric("Test R2", test_r2)
-        mlflow.log_metric("Test Pearson Correlation", test_pearson_corr)
+            # Trenowanie modelu dla bieżącego folda
+            batch_size = trial.params['batch_size']
+            epochs = trial.params['epochs']
+            final_model.fit(
+                X_train_fold,
+                y_train_fold,
+                batch_size=batch_size,
+                epochs=epochs,
+                verbose=0
+            )
 
-        # Przygotowanie przykładowego wejścia
-        sample_input = X_train[:1].astype(np.float32)
-        signature = infer_signature(sample_input, final_model.predict(sample_input))
+            # Ocena modelu na zbiorze walidacyjnym
+            y_valid_pred = final_model.predict(X_valid_fold).flatten()
+            rmse = np.sqrt(mean_squared_error(y_valid_fold, y_valid_pred))
+            mae = mean_absolute_error(y_valid_fold, y_valid_pred)
+            r2 = r2_score(y_valid_fold, y_valid_pred)
+            pearson_corr, _ = pearsonr(y_valid_fold, y_valid_pred)
 
-        # Zapisanie finalnego modelu z sygnaturą i przykładowym wejściem
-        mlflow.keras.log_model(
-            final_model,
-            "final_model",
-            signature=signature,
-            input_example=sample_input
-        )
+            rmse_scores.append(rmse)
+            mae_scores.append(mae)
+            r2_scores.append(r2)
+            pearson_scores.append(pearson_corr)
+
+        # Obliczenie średnich metryk dla 10CV
+        final_rmse = np.mean(rmse_scores)
+        final_mae = np.mean(mae_scores)
+        final_r2 = np.mean(r2_scores)
+        final_pearson = np.mean(pearson_scores)
+
+        # Logowanie średnich metryk zbioru walidacyjnego
+        mlflow.log_metric("10CV RMSE", final_rmse)
+        mlflow.log_metric("10CV MAE", final_mae)
+        mlflow.log_metric("10CV R2", final_r2)
+        mlflow.log_metric("10CV Pearson Correlation", final_pearson)
+
+        # Przewidywanie wartości dla całego zbioru danych (treningowy + testowy)
+        y_all_pred = final_model.predict(X).flatten()
+
+        # Generowanie wykresu wartości przewidywanych vs rzeczywistych dla całego zbioru
+        plt.figure(figsize=(8, 6))
+        plt.scatter(y, y_all_pred, alpha=0.6, label='Predicted vs Actual')
+        plt.plot([min(y), max(y)], [min(y), max(y)], color='red', linestyle='--', label='Ideal')
+        plt.xlabel('Actual Values')
+        plt.ylabel('Predicted Values')
+        plt.title('Predicted vs Actual Values (Entire Dataset)')
+        plt.legend()
+
+        # Zapisanie wykresu do pliku PNG
+        pred_vs_actual_fig_file = f"{csv_name}_pred_vs_actual_entire_dataset.png"
+        plt.savefig(pred_vs_actual_fig_file)
+
+        # Logowanie pliku z wykresem do MLflow
+        mlflow.log_artifact(pred_vs_actual_fig_file)
 
         # Zapisanie metryk i parametrów do pliku txt
         csv_file = os.path.basename(csv_path)
@@ -363,11 +387,11 @@ def train_final_model(csv_path, trial):
         for key, value in trial.params.items():
             summary += f"{key}: {value}\n"
 
-        summary += f"\nTest Metrics:\n"
-        summary += f"Test RMSE: {test_rmse}\n"
-        summary += f"Test MAE: {test_mae}\n"
-        summary += f"Test R2: {test_r2}\n"
-        summary += f"Test Pearson Correlation: {test_pearson_corr}\n"
+        summary += f"\n10CV Metrics:\n"
+        summary += f"10CV RMSE: {final_rmse}\n"
+        summary += f"10CV MAE: {final_mae}\n"
+        summary += f"10CV R2: {final_r2}\n"
+        summary += f"10CV Pearson Correlation: {final_pearson}\n"
 
         summary_file_name = f"{csv_name}_summary.txt"
         with open(summary_file_name, 'w') as f:
@@ -375,11 +399,11 @@ def train_final_model(csv_path, trial):
 
         mlflow.log_artifact(summary_file_name)
 
-        print(f"\nOcena na zbiorze testowym dla {csv_file}:")
-        print(f"  Test RMSE: {test_rmse}")
-        print(f"  Test MAE: {test_mae}")
-        print(f"  Test R2: {test_r2}")
-        print(f"  Test Pearson Correlation: {test_pearson_corr}")
+        print(f"\nOcena na zbiorze walidacyjnym dla {csv_file}:")
+        print(f"  10CV RMSE: {final_rmse}")
+        print(f"  10CV MAE: {final_mae}")
+        print(f"  10CV R2: {final_r2}")
+        print(f"  10CV Pearson Correlation: {final_pearson}")
 
     except Exception as e:
         print(f"Wystąpił błąd podczas treningu finalnego modelu: {e}")
@@ -431,10 +455,38 @@ if __name__ == '__main__':
 
             # Optymalizacja z użyciem mlflow_callback
             study = optuna.create_study(direction='minimize')
-            study.optimize(objective_wrapper, n_trials=300, callbacks=[mlflow_callback])
+            study.optimize(objective_wrapper, n_trials=200, callbacks=[mlflow_callback])
 
             # Logowanie najlepszych parametrów i metryk
             trial = study.best_trial
+
+            # Generowanie wykresu ważności parametrów po zakończeniu optymalizacji
+            importance_ax = optuna_viz.plot_param_importances(study)
+
+            # Uzyskanie obiektu figury
+            importance_fig = importance_ax.get_figure()
+
+            # Zapisanie wykresu do pliku PNG
+            importance_fig_file = f"{csv_name}_param_importance.png"
+            importance_fig.savefig(importance_fig_file)
+
+            # Logowanie pliku z wykresem do MLflow
+            mlflow.log_artifact(importance_fig_file)
+
+            # Zamknięcie figury, aby zwolnić zasoby
+            importance_fig.clf()
+
+            # Pobranie ważności hiperparametrów
+            param_importances = importance.get_param_importances(study)
+
+            # Zapisanie ważności hiperparametrów do pliku JSON
+            param_importances_file = f"{csv_name}_param_importance.json"
+            with open(param_importances_file, 'w') as f:
+                json.dump(param_importances, f, indent=4)
+
+            # Logowanie pliku JSON do MLflow
+            mlflow.log_artifact(param_importances_file)
+
             # for key, value in trial.params.items():
                 
             #    mlflow.log_param(key, value)
@@ -457,7 +509,7 @@ if __name__ == '__main__':
                 tags=tags_config_tensor.mlflow_tags2
             ) as training_run:
                 # Trening finalnego modelu
-                train_final_model(csv_path, trial)
+                train_final_model(csv_path, trial, csv_name)
 
         except Exception as e:
             print(f"Wystąpił błąd podczas przetwarzania {csv_file}: {e}")

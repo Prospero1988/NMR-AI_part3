@@ -22,8 +22,12 @@ import optuna
 import mlflow
 from datetime import datetime
 import argparse
+import optuna.visualization.matplotlib as optuna_viz
+import matplotlib.pyplot as plt
+import json
+from optuna import importance
 
-# Importowanie tagów MLflow z pliku tags_config.py
+# Importowanie tagów MLflow z pliku tags_config_pytorch.py
 import tags_config_pytorch
 
 # Ustawienie ziarna losowego dla powtarzalności wyników
@@ -36,6 +40,43 @@ os.environ['PYTHONHASHSEED'] = str(SEED)
 
 # Wybór urządzenia (GPU lub CPU)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+class EarlyStopping:
+    """Early stops the training if validation loss doesn't improve after a given patience."""
+    
+    def __init__(self, patience=10, verbose=False, delta=0.0):
+        """
+        Args:
+            patience (int): How long to wait after last time validation loss improved.
+            verbose (bool): If True, prints a message for each validation loss improvement.
+            delta (float): Minimum change in the monitored quantity to qualify as an improvement.
+        """
+        self.patience = patience
+        self.verbose = verbose
+        self.delta = delta
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
+    
+    def __call__(self, val_loss):
+        if self.best_loss is None:
+            self.best_loss = val_loss
+            if self.verbose:
+                print(f'Initial validation loss: {self.best_loss:.6f}')
+        elif val_loss < self.best_loss - self.delta:
+            self.best_loss = val_loss
+            self.counter = 0
+            if self.verbose:
+                print(f'Validation loss decreased to {self.best_loss:.6f}. Resetting counter.')
+        else:
+            self.counter += 1
+            if self.verbose:
+                print(f'No improvement in validation loss for {self.counter} epochs.')
+            if self.counter >= self.patience:
+                if self.verbose:
+                    print('Early stopping triggered.')
+                self.early_stop = True
 
 
 def load_data(csv_path, target_column_name='LABEL'):
@@ -62,13 +103,17 @@ def load_data(csv_path, target_column_name='LABEL'):
 
 def get_optimizer(trial, model_parameters):
     optimizer_name = trial.suggest_categorical('optimizer', ['adam', 'sgd', 'rmsprop'])
-    learning_rate = trial.suggest_float('learning_rate', 1e-5, 1e-2, log=True)
+    learning_rate = trial.suggest_float('learning_rate', 1e-5, 1e-1, log=True)
 
     if optimizer_name == 'adam':
         # Dodajemy optymalizację beta1 i beta2 dla Adama
         beta1 = trial.suggest_float('adam_beta1', 0.8, 0.9999)
         beta2 = trial.suggest_float('adam_beta2', 0.9, 0.9999)
         optimizer = optim.Adam(model_parameters, lr=learning_rate, betas=(beta1, beta2))
+    elif optimizer_name == 'adamw':
+        beta1 = trial.suggest_float('adamw_beta1', 0.8, 0.9999)
+        beta2 = trial.suggest_float('adamw_beta2', 0.9, 0.9999)
+        optimizer = optim.AdamW(model_parameters, lr=learning_rate, betas=(beta1, beta2))
     elif optimizer_name == 'sgd':
         # Dodajemy optymalizację momentum dla SGD
         momentum = trial.suggest_float('sgd_momentum', 0.0, 0.99)
@@ -76,14 +121,6 @@ def get_optimizer(trial, model_parameters):
     elif optimizer_name == 'rmsprop':
         optimizer = optim.RMSprop(model_parameters, lr=learning_rate)
     return optimizer
-
-
-def initialize_weights(m):
-    # Funkcja inicjalizacji wag
-    if isinstance(m, nn.Linear):
-        nn.init.xavier_uniform_(m.weight)
-        if m.bias is not None:
-            nn.init.zeros_(m.bias)
 
 
 class Net(nn.Module):
@@ -98,6 +135,10 @@ class Net(nn.Module):
             self.activation = nn.Tanh()
         elif activation_name == 'sigmoid':
             self.activation = nn.Sigmoid()
+        elif activation_name == 'leaky_relu':
+            self.activation = nn.LeakyReLU(negative_slope=0.01)  # negative_slope=0.01 to domyślna wartość
+        elif activation_name == 'selu':
+            self.activation = nn.SELU()
 
         # Sugestia hiperparametrów dla regularyzacji
         self.regularization = trial.suggest_categorical('regularization', ['none', 'l1', 'l2'])
@@ -107,7 +148,7 @@ class Net(nn.Module):
             self.reg_rate = trial.suggest_float('reg_rate', 1e-5, 1e-2, log=True)
 
         # Sugestia liczby warstw
-        num_layers = trial.suggest_int('num_layers', 1, 5)
+        num_layers = trial.suggest_int('num_layers', 1, 10)
         # Sugestia liczby neuronów
         units = trial.suggest_int('units', 32, 512, log=True)
         # Sugestia stopy dropout
@@ -167,26 +208,22 @@ def objective(trial, csv_path):
             X_train_full, y_train_full, test_size=0.1, random_state=SEED
         )
 
-        # Konwersja do tensora
-        X_train = torch.tensor(X_train, dtype=torch.float32)
-        y_train = torch.tensor(y_train, dtype=torch.float32)
-
         # Sugestia batch_size i epochs
-        batch_size = trial.suggest_int('batch_size', 8, 128, log=True)
-        epochs = trial.suggest_int('epochs', 50, 500, step=50)
+        batch_size = trial.suggest_int('batch_size', 16, 128, log=True)
+        epochs = trial.suggest_int('epochs', 50, 200, step=50)
+
+        # Sugestia liczby epok patience dla Early Stopping
+        early_stop_patience = trial.suggest_int('early_stop_patience', 5, 20)
 
         # Walidacja krzyżowa KFold na zbiorze treningowym
         kf = KFold(n_splits=5, shuffle=True, random_state=SEED)
         rmse_scores = []
-        mae_scores = []
-        r2_scores = []
-        pearson_scores = []
 
-        for train_index, valid_index in kf.split(X_train):
-            X_train_fold = X_train[train_index].to(device)
-            X_valid_fold = X_train[valid_index].to(device)
-            y_train_fold = y_train[train_index].to(device)
-            y_valid_fold = y_train[valid_index].to(device)
+        for fold, (train_index, valid_index) in enumerate(kf.split(X_train), 1):
+            X_train_fold = X_train[train_index]
+            X_valid_fold = X_train[valid_index]
+            y_train_fold = y_train[train_index]
+            y_valid_fold = y_train[valid_index]
 
             # Tworzenie modelu
             input_dim = X_train_fold.shape[1]
@@ -203,16 +240,33 @@ def objective(trial, csv_path):
             if use_scheduler:
                 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5)
 
+            # Inicjalizacja EarlyStopping
+            early_stopping = EarlyStopping(patience=early_stop_patience, verbose=False)
+
             # Trenowanie modelu
-            dataset = torch.utils.data.TensorDataset(X_train_fold, y_train_fold)
-            loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+            dataset = torch.utils.data.TensorDataset(torch.tensor(X_train_fold, dtype=torch.float32),
+                                                     torch.tensor(y_train_fold, dtype=torch.float32))
+            loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
 
             for epoch in range(epochs):
                 model.train()
                 for batch_X, batch_y in loader:
+                    batch_X = batch_X.to(device)
+                    batch_y = batch_y.to(device)
+
                     optimizer.zero_grad()
-                    outputs = model(batch_X).squeeze()
-                    loss = criterion(outputs, batch_y)
+
+                    # Sprawdzenie rozmiaru batcha
+                    if batch_X.size(0) > 1:
+                        # Jeśli batch ma więcej niż 1 próbkę, wszystko działa normalnie
+                        outputs = model(batch_X).squeeze()
+                        loss = criterion(outputs.view(-1), batch_y)
+                    else:
+                        # Jeśli batch ma tylko 1 próbkę, możesz podjąć decyzję, co zrobić
+                        # np. ominąć ten batch lub obsłużyć to w inny sposób
+                        print("Batch size is 1, skipping BatchNorm-related operations.")
+                        continue
+
                     # Dodanie regularizacji
                     if model.regularization == 'l1':
                         l1_norm = sum(p.abs().sum() for p in model.parameters())
@@ -231,20 +285,30 @@ def objective(trial, csv_path):
                 if use_scheduler:
                     scheduler.step(loss)
 
+                # Walidacja po każdej epoce
+                model.eval()
+                with torch.no_grad():
+                    X_valid_tensor = torch.tensor(X_valid_fold, dtype=torch.float32).to(device)
+                    y_valid_tensor = torch.tensor(y_valid_fold, dtype=torch.float32).to(device)
+                    y_valid_pred = model(X_valid_tensor).squeeze().cpu().numpy()
+                    y_valid_true = y_valid_tensor.cpu().numpy()
+                    val_loss = mean_squared_error(y_valid_true, y_valid_pred)
+
+                # Aktualizacja EarlyStopping
+                early_stopping(val_loss)
+                if early_stopping.early_stop:
+                    break
+
             # Ocena modelu
             model.eval()
             with torch.no_grad():
-                y_pred = model(X_valid_fold).squeeze().cpu().numpy()
-                y_true = y_valid_fold.cpu().numpy()
+                X_valid_tensor = torch.tensor(X_valid_fold, dtype=torch.float32).to(device)
+                y_valid_tensor = torch.tensor(y_valid_fold, dtype=torch.float32).to(device)
+                y_pred = model(X_valid_tensor).squeeze().cpu().numpy()
+                y_true = y_valid_tensor.cpu().numpy()
                 rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-                mae = mean_absolute_error(y_true, y_pred)
-                r2 = r2_score(y_true, y_pred)
-                pearson_corr, _ = pearsonr(y_true, y_pred)
 
             rmse_scores.append(rmse)
-            mae_scores.append(mae)
-            r2_scores.append(r2)
-            pearson_scores.append(pearson_corr)
 
             # Zarządzanie pamięcią
             del model
@@ -252,22 +316,12 @@ def objective(trial, csv_path):
 
         # Obliczenie średnich metryk
         final_rmse = np.mean(rmse_scores)
-        final_mae = np.mean(mae_scores)
-        final_r2 = np.mean(r2_scores)
-        final_pearson = np.mean(pearson_scores)
-        std_mae = np.std(mae_scores)
 
         # Logowanie metryki dla bieżącego trialu
         mlflow.log_metric("Trial RMSE", final_rmse, step=trial.number)
-        mlflow.log_metric("Trial MAE", final_mae, step=trial.number)
-        mlflow.log_metric("Trial R2", final_r2, step=trial.number)
 
         # Logowanie metryk
         trial.set_user_attr('rmse', final_rmse)
-        trial.set_user_attr('mae', final_mae)
-        trial.set_user_attr('r2', final_r2)
-        trial.set_user_attr('pearson_corr', final_pearson)
-        trial.set_user_attr('std_mae', std_mae)
 
         # Zwracanie RMSE jako wartości celu
         return final_rmse
@@ -277,112 +331,163 @@ def objective(trial, csv_path):
         raise e
 
 
-def train_final_model(csv_path, trial):
+def train_final_model(csv_path, trial, csv_name):
     try:
         # Wczytanie danych
-        X_train_full, y_train_full = load_data(csv_path, target_column_name='LABEL')
+        X_full, y_full = load_data(csv_path, target_column_name='LABEL')
 
         # Konwersja do tensora
-        X_train_full = X_train_full.astype(np.float32)
-        y_train_full = y_train_full.astype(np.float32)
+        X_full = X_full.astype(np.float32)
+        y_full = y_full.astype(np.float32)
 
-        # Podział danych na zbiory treningowy i testowy
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_train_full, y_train_full, test_size=0.1, random_state=SEED
-        )
+        # Inicjalizacja K-fold cross-validation
+        kf = KFold(n_splits=10, shuffle=True, random_state=SEED)
 
-        # Konwersja do tensora
-        X_train = torch.tensor(X_train, dtype=torch.float32).to(device)
-        y_train = torch.tensor(y_train, dtype=torch.float32).to(device)
-        X_test = torch.tensor(X_test, dtype=torch.float32).to(device)
-        y_test = torch.tensor(y_test, dtype=torch.float32).to(device)
+        rmse_scores = []
+        mae_scores = []
+        r2_scores = []
+        pearson_scores = []
 
-        # Tworzenie modelu z najlepszymi parametrami
-        input_dim = X_train.shape[1]
-        model = Net(trial, input_dim).to(device)
+        # Zbiory do zbierania wszystkich prawdziwych i przewidzianych wartości
+        all_true = []
+        all_preds = []
 
-        # Definicja kryterium straty
-        criterion = nn.MSELoss()
+        # Pobranie hiperparametrów z najlepszego triala
+        params = trial.params
 
-        # Definicja optymalizatora
-        optimizer_name = trial.params['optimizer']
-        learning_rate = trial.params['learning_rate']
-        if optimizer_name == 'adam':
-            optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-        elif optimizer_name == 'sgd':
-            optimizer = optim.SGD(model.parameters(), lr=learning_rate)
-        elif optimizer_name == 'rmsprop':
-            optimizer = optim.RMSprop(model.parameters(), lr=learning_rate)
+        # Dodanie default dla brakujących parametrów
+        optimizer_name = params.get('optimizer', 'adam')
+        learning_rate = params.get('learning_rate', 1e-3)
+        adam_beta1 = params.get('adam_beta1', 0.9)
+        adam_beta2 = params.get('adam_beta2', 0.999)
+        sgd_momentum = params.get('sgd_momentum', 0.0)
+        use_scheduler = params.get('use_scheduler', False)
+        early_stop_patience = params.get('early_stop_patience', 10)
+        clip_grad_value = params.get('clip_grad_value', 1.0)
 
-        # Pobranie batch_size i epochs z najlepszych parametrów
-        batch_size = trial.params['batch_size']
-        epochs = trial.params['epochs']
+        for fold, (train_index, test_index) in enumerate(kf.split(X_full), 1):
+            X_train, X_test = X_full[train_index], X_full[test_index]
+            y_train, y_test = y_full[train_index], y_full[test_index]
 
-        # Definicja schematu zmiany współczynnika uczenia
-        use_scheduler = trial.params['use_scheduler']
-        if use_scheduler:
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5)
+            # Tworzenie modelu z najlepszymi parametrami
+            input_dim = X_train.shape[1]
+            model = Net(trial, input_dim).to(device)
 
-        dataset = torch.utils.data.TensorDataset(X_train, y_train)
-        loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+            # Definicja kryterium straty
+            criterion = nn.MSELoss()
 
-        for epoch in range(epochs):
-            model.train()
-            for batch_X, batch_y in loader:
-                optimizer.zero_grad()
-                outputs = model(batch_X).squeeze()
-                loss = criterion(outputs, batch_y)
-                # Dodanie regularizacji
-                if model.regularization == 'l1':
-                    l1_norm = sum(p.abs().sum() for p in model.parameters())
-                    loss = loss + model.reg_rate * l1_norm
-                elif model.regularization == 'l2':
-                    l2_norm = sum(p.pow(2).sum() for p in model.parameters())
-                    loss = loss + model.reg_rate * l2_norm
-                loss.backward()
+            # Definicja optymalizatora
+            if optimizer_name == 'adam':
+                optimizer = optim.Adam(model.parameters(), lr=learning_rate,
+                                       betas=(adam_beta1, adam_beta2))
+            elif optimizer_name == 'sgd':
+                optimizer = optim.SGD(model.parameters(), lr=learning_rate, momentum=sgd_momentum)
+            elif optimizer_name == 'rmsprop':
+                optimizer = optim.RMSprop(model.parameters(), lr=learning_rate)
+            else:
+                raise ValueError(f"Nieznany optymalizator: {optimizer_name}")
 
-                # Gradient Clipping
-                clip_grad_value = trial.params['clip_grad_value']
-                torch.nn.utils.clip_grad_value_(model.parameters(), clip_grad_value)
-
-                optimizer.step()
-
+            # Definicja schematu zmiany współczynnika uczenia
             if use_scheduler:
-                scheduler.step(loss)
+                scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5)
 
-        # Ocena modelu na zbiorze testowym
-        model.eval()
-        with torch.no_grad():
-            y_test_pred = model(X_test).squeeze().cpu().numpy()
-            y_test_true = y_test.cpu().numpy()
-            test_rmse = np.sqrt(mean_squared_error(y_test_true, y_test_pred))
-            test_mae = mean_absolute_error(y_test_true, y_test_pred)
-            test_r2 = r2_score(y_test_true, y_test_pred)
-            test_pearson_corr, _ = pearsonr(y_test_true, y_test_pred)
+            # Inicjalizacja EarlyStopping
+            early_stopping = EarlyStopping(patience=early_stop_patience, verbose=False)
+
+            # Trenowanie modelu
+            dataset = torch.utils.data.TensorDataset(torch.tensor(X_train, dtype=torch.float32),
+                                                     torch.tensor(y_train, dtype=torch.float32))
+            loader = torch.utils.data.DataLoader(dataset, batch_size=params['batch_size'], shuffle=True, num_workers=0)
+
+            for epoch in range(params['epochs']):
+                model.train()
+                for batch_X, batch_y in loader:
+                    batch_X = batch_X.to(device)
+                    batch_y = batch_y.to(device)
+
+                    optimizer.zero_grad()
+                    outputs = model(batch_X).squeeze()
+                    loss = criterion(outputs, batch_y)
+                    # Dodanie regularizacji
+                    if model.regularization == 'l1':
+                        l1_norm = sum(p.abs().sum() for p in model.parameters())
+                        loss = loss + model.reg_rate * l1_norm
+                    elif model.regularization == 'l2':
+                        l2_norm = sum(p.pow(2).sum() for p in model.parameters())
+                        loss = loss + model.reg_rate * l2_norm
+                    loss.backward()
+
+                    # Gradient Clipping
+                    torch.nn.utils.clip_grad_value_(model.parameters(), clip_grad_value)
+
+                    optimizer.step()
+
+                if use_scheduler:
+                    scheduler.step(loss)
+
+                # Walidacja po każdej epoce
+                model.eval()
+                with torch.no_grad():
+                    X_test_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
+                    y_test_tensor = torch.tensor(y_test, dtype=torch.float32).to(device)
+                    y_valid_pred = model(X_test_tensor).squeeze().cpu().numpy()
+                    y_valid_true = y_test_tensor.cpu().numpy()
+                    val_loss = mean_squared_error(y_valid_true, y_valid_pred)
+
+                # Aktualizacja EarlyStopping
+                early_stopping(val_loss)
+                if early_stopping.early_stop:
+                    print(f'Fold {fold}: Early stopping triggered at epoch {epoch+1}')
+                    break
+
+            # Ocena modelu na bieżącym zbiorze testowym
+            model.eval()
+            with torch.no_grad():
+                y_test_pred = model(torch.tensor(X_test, dtype=torch.float32).to(device)).squeeze().detach().cpu().numpy()
+                y_test_true = torch.tensor(y_test, dtype=torch.float32).to(device).cpu().numpy()
+                rmse = np.sqrt(mean_squared_error(y_test_true, y_test_pred))
+                mae = mean_absolute_error(y_test_true, y_test_pred)
+                r2 = r2_score(y_test_true, y_test_pred)
+                pearson_corr, _ = pearsonr(y_test_true, y_test_pred)
+
+            rmse_scores.append(rmse)
+            mae_scores.append(mae)
+            r2_scores.append(r2)
+            pearson_scores.append(pearson_corr)
+
+            # Zbieranie predykcji i prawdziwych wartości
+            all_true.extend(y_test_true)
+            all_preds.extend(y_test_pred)
+
+            # Zarządzanie pamięcią
+            del model  # Ensure the model is deleted to free memory
+            torch.cuda.empty_cache()
+
+        # Obliczenie średnich metryk z K-fold cross-validation
+        final_rmse = np.mean(rmse_scores)
+        final_mae = np.mean(mae_scores)
+        final_r2 = np.mean(r2_scores)
+        final_pearson = np.mean(pearson_scores)
 
         # Logowanie metryk zbioru testowego
-        mlflow.log_metric("Test RMSE", test_rmse)
-        mlflow.log_metric("Test MAE", test_mae)
-        mlflow.log_metric("Test R2", test_r2)
-        mlflow.log_metric("Test Pearson Correlation", test_pearson_corr)
-
-        # Zapisanie finalnego modelu
-        csv_file = os.path.basename(csv_path)
-        csv_name = os.path.splitext(csv_file)[0]
-        model_file_name = f"{csv_name}_optimized_model.pt"
-        torch.save(model.state_dict(), model_file_name)
-        mlflow.log_artifact(model_file_name)
+        mlflow.log_metric("RMSE", final_rmse)
+        mlflow.log_metric("MAE", final_mae)
+        mlflow.log_metric("R2", final_r2)
+        mlflow.log_metric("Pearson Correlation", final_pearson)
 
         # Zapisanie metryk i parametrów do pliku txt
+        csv_file = os.path.basename(csv_path)
+        csv_name = os.path.splitext(csv_file)[0]
+
         summary = f"Best parameters:\n"
         for key, value in trial.params.items():
             summary += f"{key}: {value}\n"
 
-        summary += f"\nTest Metrics:\n"
-        summary += f"Test RMSE: {test_rmse}\n"
-        summary += f"Test MAE: {test_mae}\n"
-        summary += f"Test R2: {test_r2}\n"
-        summary += f"Test Pearson Correlation: {test_pearson_corr}\n"
+        summary += f"\n10CV Metrics:\n"
+        summary += f"10CV RMSE: {final_rmse}\n"
+        summary += f"10CV MAE: {final_mae}\n"
+        summary += f"10CV R2: {final_r2}\n"
+        summary += f"10CV Pearson Correlation: {final_pearson}\n"
 
         summary_file_name = f"{csv_name}_summary.txt"
         with open(summary_file_name, 'w') as f:
@@ -390,11 +495,26 @@ def train_final_model(csv_path, trial):
 
         mlflow.log_artifact(summary_file_name)
 
-        print(f"\nOcena na zbiorze testowym dla {csv_file}:")
-        print(f"  Test RMSE: {test_rmse}")
-        print(f"  Test MAE: {test_mae}")
-        print(f"  Test R2: {test_r2}")
-        print(f"  Test Pearson Correlation: {test_pearson_corr}")
+        print(f"\nOcena na zbiorze walidacyjnym dla {csv_file}:")
+        print(f"  10CV RMSE: {final_rmse}")
+        print(f"  10CV MAE: {final_mae}")
+        print(f"  10CV R2: {final_r2}")
+        print(f"  10CV Pearson Correlation: {final_pearson}")
+
+        # Generowanie wykresu dla wszystkich foldów
+        plt.figure(figsize=(8, 6))
+        plt.scatter(all_true, all_preds, alpha=0.6, label='Predicted vs Actual')
+        plt.plot([min(all_true), max(all_true)], [min(all_true), max(all_true)], color='red', linestyle='--', label='Ideal')
+        plt.xlabel('Actual Values')
+        plt.ylabel('Predicted Values')
+        plt.title('Predicted vs Actual Values (Cross-Validation)')
+        plt.legend()
+
+        # Zapisanie wykresu do pliku PNG
+        pred_vs_actual_fig_file = f"{csv_name}_pred_vs_actual_cv.png"
+        plt.savefig(pred_vs_actual_fig_file)
+        mlflow.log_artifact(pred_vs_actual_fig_file)
+        plt.close()
 
     except Exception as e:
         print(f"Wystąpił błąd podczas treningu finalnego modelu: {e}")
@@ -444,21 +564,46 @@ if __name__ == '__main__':
                     return objective(trial, csv_path)
 
                 study = optuna.create_study(direction='minimize')
-                study.optimize(objective_wrapper, n_trials=300)
+                study.optimize(objective_wrapper, n_trials=1000)  # Zwiększono liczbę prób
+
                 torch.cuda.empty_cache()
-                
+
                 # Logowanie najlepszych parametrów
                 trial = study.best_trial
                 mlflow.log_param("best_value", trial.value)
                 for key, value in trial.params.items():
                     mlflow.log_param(key, value)
 
+                # Generowanie wykresu ważności parametrów po zakończeniu optymalizacji
+                importance_ax = optuna_viz.plot_param_importances(study)
+
+                # Pobranie obiektu Figure z Axes
+                importance_fig = importance_ax.get_figure()
+
+                # Zapisanie wykresu do pliku PNG
+                importance_fig_file = f"{csv_name}_param_importance.png"
+                importance_fig.savefig(importance_fig_file)
+
+                # Logowanie pliku z wykresem do MLflow
+                mlflow.log_artifact(importance_fig_file)
+
+                # Zamknięcie figury, aby zwolnić zasoby
+                plt.close(importance_fig)
+
+                # Pobranie ważności hiperparametrów
+                param_importances = importance.get_param_importances(study)
+
+                # Zapisanie ważności hiperparametrów do pliku JSON
+                param_importances_file = f"{csv_name}_param_importance.json"
+                with open(param_importances_file, 'w') as f:
+                    json.dump(param_importances, f, indent=4)
+
+                # Logowanie pliku JSON do MLflow
+                mlflow.log_artifact(param_importances_file)
+
                 # Logowanie dodatkowych metryk z najlepszego trialu
-                mlflow.log_metric("RMSE", trial.user_attrs['rmse'])
-                mlflow.log_metric("MAE", trial.user_attrs['mae'])
-                mlflow.log_metric("R2", trial.user_attrs['r2'])
-                mlflow.log_metric("Pearson Correlation", trial.user_attrs['pearson_corr'])
-                mlflow.log_metric("MAE Std Dev", trial.user_attrs['std_mae'])
+                mlflow.log_metric("RMSE", trial.user_attrs.get('rmse', None))
+                # Dodatkowe metryki mogą być logowane w funkcji train_final_model
 
                 print(f"Najlepszy trial dla {csv_file}:")
                 print(f"  Wartość (RMSE): {trial.value}")
@@ -472,7 +617,7 @@ if __name__ == '__main__':
                 tags=tags_config_pytorch.mlflow_tags2
             ) as training_run:
                 # Trening finalnego modelu
-                train_final_model(csv_path, trial)
+                train_final_model(csv_path, trial, csv_name)
 
         except Exception as e:
             print(f"Wystąpił błąd podczas przetwarzania {csv_file}: {e}")
