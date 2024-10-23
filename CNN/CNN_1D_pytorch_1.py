@@ -28,7 +28,7 @@ import json
 from optuna import importance
 
 # Import MLflow tags from a configuration file
-import tags_config_pytorch
+import tags_config_pytorch_CNN_1D
 
 # Set random seed for reproducibility
 SEED = 88
@@ -544,6 +544,14 @@ def train_final_model(csv_path, trial, csv_name):
         mlflow.log_artifact(pred_vs_actual_fig_file)
         plt.close()
 
+        # Save all_true and all_preds to CSV
+        predictions_df = pd.DataFrame({'Actual': all_true, 'Predicted': all_preds})
+        predictions_file_name = f"{csv_name}_predictions.csv"
+        predictions_df.to_csv(predictions_file_name, index=False)
+        mlflow.log_artifact(predictions_file_name)
+
+        print(f"Predictions saved as {predictions_file_name} and logged to MLflow.")
+
     except Exception as e:
         print(f"Error during final model training: {e}")
         raise e
@@ -554,6 +562,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train CNN models on CSV files in a directory.')
     parser.add_argument('--csv_path', type=str, required=True, help='Path to the directory containing CSV files.')
     parser.add_argument('--experiment_name', type=str, required=False, default='Default', help='MLflow experiment name.')
+    parser.add_argument('--n_trials', type=int, required=False, default=1000, help='Number of trials for optuna optimization of Hyper Parameters')
 
     args = parser.parse_args()
 
@@ -585,14 +594,14 @@ if __name__ == '__main__':
             # MLflow run for hyperparameter optimization
             with mlflow.start_run(
                 run_name=f"Optimization_{csv_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
-                tags=tags_config_pytorch.mlflow_tags1
+                tags=tags_config_pytorch_CNN_1D.mlflow_tags1
             ) as optuna_run:
                 # Objective function wrapper
                 def objective_wrapper(trial):
                     return objective(trial, csv_path)
 
                 study = optuna.create_study(direction='minimize')
-                study.optimize(objective_wrapper, n_trials=200)  # Adjust number of trials as needed
+                study.optimize(objective_wrapper, n_trials=args.n_trials)  # Adjust number of trials as needed
 
                 torch.cuda.empty_cache()
 
@@ -629,7 +638,7 @@ if __name__ == '__main__':
             # MLflow run for final model training
             with mlflow.start_run(
                 run_name=f"Training_{csv_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
-                tags=tags_config_pytorch.mlflow_tags2
+                tags=tags_config_pytorch_CNN_1D.mlflow_tags2
             ) as training_run:
                 # Train final model
                 train_final_model(csv_path, trial, csv_name)

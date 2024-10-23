@@ -35,3 +35,27 @@ y = torch.tensor(labels1, dtype=torch.float32)  # Etykiety (wartości docelowe)
 # Sprawdzenie rozmiaru tensora
 print(X.shape)  # Oczekiwane wymiary: (n_samples, n_features, 2)
 print(y.shape)  # Oczekiwane wymiary: (n_samples,)
+
+
+parser.add_argument('--csv1', type=str, required=True, help='Path to the first CSV file.')
+parser.add_argument('--csv2', type=str, required=True, help='Path to the second CSV file.')
+args = parser.parse_args()
+
+data1 = args.csv1
+data2 = args.csv2
+
+data1 = data1.drop(data1.columns[0], axis=1)
+data2 = data2.drop(data2.columns[0], axis=1)
+
+labels1 = data1.iloc[:, 0].values
+labels2 = data2.iloc[:, 0].values
+
+assert np.array_equal(labels1, labels2), "Etykiety w obu plikach muszą być takie same!"
+
+features1 = data1.iloc[:, 1:].values  # Wektory cech dla 1H
+features2 = data2.iloc[:, 1:].values  # Wektory cech dla 13C
+
+tensor = np.stack((features1, features2), axis=-1)
+
+X = torch.tensor(tensor, dtype=torch.float32)
+y = torch.tensor(labels1, dtype=torch.float32)
