@@ -9,7 +9,7 @@ mlflow_tags1 = {
 }
 
 mlflow_tags2 = {
-    "predictor": "1H",
+    "predictor": "1Hx13C",
     "model": "XGB",
     "stage": "training",
     "author": "aleniak",
