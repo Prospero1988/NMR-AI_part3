@@ -13,10 +13,13 @@ def main():
     experiment_name = args.experiment_name
 
     # Call hyperparameter optimization module
-    #subprocess.run(['python', 'module1.py', input_directory, '--experiment_name', experiment_name])
+    subprocess.run(['python', 'module1.py', input_directory, '--experiment_name', experiment_name])
 
-    # Call training module
+    # Call training module with 10CV evaluation
     subprocess.run(['python', 'module2.py', input_directory, '--experiment_name', experiment_name])
+
+    # Call training module with LOO evaluation
+    subprocess.run(['python', 'module3.py', input_directory, '--experiment_name', experiment_name])
 
 if __name__ == "__main__":
     main()

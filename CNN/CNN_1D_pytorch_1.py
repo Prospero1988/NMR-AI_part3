@@ -181,7 +181,7 @@ class Net(nn.Module):
         self.conv = nn.Sequential(*conv_layers)
 
         # Fully connected layers
-        num_fc_layers = trial.suggest_int('num_fc_layers', 1, 3)
+        num_fc_layers = trial.suggest_int('num_fc_layers', 2, 5)
         fc_layers = []
         in_features = in_channels * input_length
 
@@ -238,10 +238,10 @@ def objective(trial, csv_path):
 
         # Suggest hyperparameters
         batch_size = trial.suggest_int('batch_size', 16, 128, log=True)
-        epochs = trial.suggest_int('epochs', 50, 200, step=50)
+        epochs = trial.suggest_int('epochs', 50, 500, step=50)
         early_stop_patience = trial.suggest_int('early_stop_patience', 5, 20)
         use_scheduler = trial.suggest_categorical('use_scheduler', [True, False])
-        clip_grad_value = trial.suggest_float('clip_grad_value', 0.1, 1.0, step=0.1)
+        clip_grad_value = trial.suggest_float('clip_grad_value', 0.1, 3.0, step=0.1)
 
         # K-Fold cross-validation
         kf = KFold(n_splits=5, shuffle=True, random_state=SEED)

@@ -15,8 +15,11 @@ def main():
     # Call module1.py
     #subprocess.run(['python', 'module1.py', input_directory, '--experiment_name', experiment_name])
 
-    # Call module2.py
+    # Call module2.py 10CV evaluation
     subprocess.run(['python', 'module2.py', input_directory, '--experiment_name', experiment_name])
+
+    # Call module3.py LOO evaluation
+    subprocess.run(['python', 'module3.py', input_directory, '--experiment_name', experiment_name])
 
 if __name__ == "__main__":
     main()
