@@ -11,7 +11,7 @@ mlflow_tags1 = {
 
 mlflow_tags2 = {
     "architecture": "Pytorch",
-    "predictor": "1H",
+    "predictor": "RDKit",
     "model": "CNN 1D",
     "stage": "training",
     "author": "aleniak",

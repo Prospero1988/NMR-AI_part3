@@ -552,6 +552,97 @@ def train_final_model(csv_path, trial, csv_name):
 
         print(f"Predictions saved as {predictions_file_name} and logged to MLflow.")
 
+        # =================== Added code to save the final model ===================
+
+        # Train final model on the full dataset
+        print("Training final model on full dataset...")
+        try:
+            # Create model with best params
+            input_dim = X_full.shape[1]
+            final_model = Net(trial, input_dim).to(device)
+
+            # Loss criterion
+            criterion = nn.MSELoss()
+
+            # Optimizer
+            if optimizer_name == 'adam':
+                optimizer = optim.Adam(final_model.parameters(), lr=learning_rate,
+                                       betas=(adam_beta1, adam_beta2))
+            elif optimizer_name == 'sgd':
+                optimizer = optim.SGD(final_model.parameters(), lr=learning_rate, momentum=sgd_momentum)
+            elif optimizer_name == 'rmsprop':
+                optimizer = optim.RMSprop(final_model.parameters(), lr=learning_rate)
+            elif optimizer_name == 'adamw':
+                optimizer = optim.AdamW(final_model.parameters(), lr=learning_rate,
+                                        betas=(adam_beta1, adam_beta2))
+            else:
+                raise ValueError(f"Unknown optimizer: {optimizer_name}")
+
+            # Scheduler
+            if use_scheduler:
+                scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5)
+
+            # Early stopping
+            early_stopping = EarlyStopping(patience=early_stop_patience, verbose=False)
+
+            # Training
+            dataset = torch.utils.data.TensorDataset(torch.tensor(X_full, dtype=torch.float32),
+                                                     torch.tensor(y_full, dtype=torch.float32))
+            loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+
+            for epoch in range(epochs):
+                final_model.train()
+                for batch_X, batch_y in loader:
+                    batch_X = batch_X.to(device)
+                    batch_y = batch_y.to(device)
+
+                    optimizer.zero_grad()
+
+                    if batch_X.size(0) > 1:
+                        outputs = final_model(batch_X).squeeze()
+                        loss = criterion(outputs, batch_y)
+                    else:
+                        continue  # Skip if batch size is 1
+
+                    # Add regularization
+                    if final_model.regularization == 'l1':
+                        l1_norm = sum(p.abs().sum() for p in final_model.parameters())
+                        loss = loss + final_model.reg_rate * l1_norm
+                    elif final_model.regularization == 'l2':
+                        l2_norm = sum(p.pow(2).sum() for p in final_model.parameters())
+                        loss = loss + final_model.reg_rate * l2_norm
+                    loss.backward()
+
+                    # Gradient clipping
+                    torch.nn.utils.clip_grad_value_(final_model.parameters(), clip_grad_value)
+
+                    optimizer.step()
+
+                if use_scheduler:
+                    scheduler.step(loss)
+
+                # Early stopping check
+                early_stopping(loss.item())
+                if early_stopping.early_stop:
+                    print(f'Final model: Early stopping triggered at epoch {epoch+1}')
+                    break
+
+            # Save the final model
+            model_file_name = f"{csv_name}_final_model.pth"
+            torch.save(final_model.state_dict(), model_file_name)
+            mlflow.log_artifact(model_file_name)
+
+            # Log the model with MLflow PyTorch
+            mlflow.pytorch.log_model(final_model, artifact_path="model")
+
+            print(f"Final model saved as {model_file_name} and logged to MLflow.")
+
+        except Exception as e:
+            print(f"Error during final model training on full dataset: {e}")
+            raise e
+
+        # =================== End of added code ===================
+
     except Exception as e:
         print(f"Error during final model training: {e}")
         raise e

@@ -12,9 +12,10 @@ mlflow_tags1 = {
 mlflow_tags2 = {
     "architecture": "Pytorch",
     "predictor": "1H",
-    "model": "DMLP",
+    "model": "MLP",
     "stage": "training",
     "author": "aleniak",
     "opt trials": "2000",
+    "evaluation": "10CV",
     "property": "CHIlogD"
 }

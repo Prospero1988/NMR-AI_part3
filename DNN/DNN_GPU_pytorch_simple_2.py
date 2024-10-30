@@ -20,6 +20,7 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from scipy.stats import pearsonr
 import optuna
 import mlflow
+import mlflow.pytorch  # Import dla mlflow.pytorch
 from datetime import datetime
 import argparse
 import optuna.visualization.matplotlib as optuna_viz
@@ -331,7 +332,7 @@ def objective(trial, csv_path):
         raise e
 
 
-def train_final_model(csv_path, trial, csv_name):
+def evaluate_model_with_cv(csv_path, trial, csv_name):
     try:
         # Wczytanie danych
         X_full, y_full = load_data(csv_path, target_column_name='LABEL')
@@ -364,6 +365,8 @@ def train_final_model(csv_path, trial, csv_name):
         use_scheduler = params.get('use_scheduler', False)
         early_stop_patience = params.get('early_stop_patience', 10)
         clip_grad_value = params.get('clip_grad_value', 1.0)
+        batch_size = params.get('batch_size', 32)
+        epochs = params.get('epochs', 100)
 
         for fold, (train_index, test_index) in enumerate(kf.split(X_full), 1):
             X_train, X_test = X_full[train_index], X_full[test_index]
@@ -397,9 +400,9 @@ def train_final_model(csv_path, trial, csv_name):
             # Trenowanie modelu
             dataset = torch.utils.data.TensorDataset(torch.tensor(X_train, dtype=torch.float32),
                                                      torch.tensor(y_train, dtype=torch.float32))
-            loader = torch.utils.data.DataLoader(dataset, batch_size=params['batch_size'], shuffle=True, num_workers=0)
+            loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
 
-            for epoch in range(params['epochs']):
+            for epoch in range(epochs):
                 model.train()
                 for batch_X, batch_y in loader:
                     batch_X = batch_X.to(device)
@@ -517,7 +520,58 @@ def train_final_model(csv_path, trial, csv_name):
         plt.close()
 
     except Exception as e:
-        print(f"Wystąpił błąd podczas treningu finalnego modelu: {e}")
+        print(f"Wystąpił błąd podczas oceny modelu z walidacją krzyżową: {e}")
+        raise e
+
+
+def train_final_model(csv_path, trial, csv_name):
+    try:
+        # Wczytanie danych
+        X_full, y_full = load_data(csv_path, target_column_name='LABEL')
+
+        # Konwersja do tensora
+        X_full = X_full.astype(np.float32)
+        y_full = y_full.astype(np.float32)
+
+        # Tworzenie modelu z najlepszymi parametrami
+        input_dim = X_full.shape[1]
+        model = Net(trial, input_dim).to(device)
+
+        # Definicja kryterium straty
+        criterion = nn.MSELoss()
+
+        # Definicja optymalizatora
+        optimizer = get_optimizer(trial, model.parameters())
+
+        # Pobranie hiperparametrów z triala
+        batch_size = trial.params.get('batch_size', 32)
+        epochs = trial.params.get('epochs', 100)
+
+        # Trenowanie modelu na całym zbiorze danych
+        dataset = torch.utils.data.TensorDataset(torch.tensor(X_full, dtype=torch.float32),
+                                                 torch.tensor(y_full, dtype=torch.float32))
+        loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+        for epoch in range(epochs):
+            model.train()
+            for batch_X, batch_y in loader:
+                batch_X = batch_X.to(device)
+                batch_y = batch_y.to(device)
+                optimizer.zero_grad()
+                outputs = model(batch_X).squeeze()
+                loss = criterion(outputs, batch_y)
+                loss.backward()
+                optimizer.step()
+
+        # Zapisanie modelu
+        model_file_name = f"{csv_name}_final_model.pth"
+        torch.save(model.state_dict(), model_file_name)
+
+        # Logowanie modelu do MLflow wraz ze środowiskiem Conda
+        mlflow.pytorch.log_model(model, "model")
+
+    except Exception as e:
+        print(f"Wystąpił błąd podczas trenowania finalnego modelu: {e}")
         raise e
 
 
@@ -603,7 +657,7 @@ if __name__ == '__main__':
 
                 # Logowanie dodatkowych metryk z najlepszego trialu
                 mlflow.log_metric("RMSE", trial.user_attrs.get('rmse', None))
-                # Dodatkowe metryki mogą być logowane w funkcji train_final_model
+                # Dodatkowe metryki mogą być logowane w funkcji evaluate_model_with_cv
 
                 print(f"Najlepszy trial dla {csv_file}:")
                 print(f"  Wartość (RMSE): {trial.value}")
@@ -611,12 +665,20 @@ if __name__ == '__main__':
                 for key, value in trial.params.items():
                     print(f"    {key}: {value}")
 
+            # Rozpoczęcie nowego runu MLflow dla oceny modelu z walidacją krzyżową
+            with mlflow.start_run(
+                run_name=f"Evaluation_{csv_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
+                tags=tags_config_pytorch.mlflow_tags2
+            ) as evaluation_run:
+                # Ocena modelu z użyciem 10-krotnej walidacji krzyżowej
+                evaluate_model_with_cv(csv_path, trial, csv_name)
+
             # Rozpoczęcie nowego runu MLflow dla treningu finalnego modelu
             with mlflow.start_run(
                 run_name=f"Training_{csv_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
-                tags=tags_config_pytorch.mlflow_tags2
+                tags=tags_config_pytorch.mlflow_tags3
             ) as training_run:
-                # Trening finalnego modelu
+                # Trenowanie finalnego modelu
                 train_final_model(csv_path, trial, csv_name)
 
         except Exception as e:
