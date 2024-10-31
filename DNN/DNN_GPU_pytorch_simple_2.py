@@ -36,7 +36,8 @@ SEED = 88
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
 os.environ['PYTHONHASHSEED'] = str(SEED)
 
 # Wybór urządzenia (GPU lub CPU)
@@ -128,34 +129,18 @@ class Net(nn.Module):
     def __init__(self, trial, input_dim):
         super(Net, self).__init__()
 
-        # Sugestia hiperparametrów dla funkcji aktywacji
-        activation_name = trial.suggest_categorical('activation', ['relu', 'tanh', 'sigmoid'])
-        if activation_name == 'relu':
-            self.activation = nn.ReLU()
-        elif activation_name == 'tanh':
-            self.activation = nn.Tanh()
-        elif activation_name == 'sigmoid':
-            self.activation = nn.Sigmoid()
-        elif activation_name == 'leaky_relu':
-            self.activation = nn.LeakyReLU(negative_slope=0.01)  # negative_slope=0.01 to domyślna wartość
-        elif activation_name == 'selu':
-            self.activation = nn.SELU()
+        # Activation function selection
+        activation_name = trial.suggest_categorical('activation', ['relu', 'tanh', 'sigmoid', 'leaky_relu', 'selu'])
+        self.activation = self.get_activation_function(activation_name)
 
-        # Sugestia hiperparametrów dla regularyzacji
+        # Regularization
         self.regularization = trial.suggest_categorical('regularization', ['none', 'l1', 'l2'])
-        if self.regularization == 'none':
-            self.reg_rate = 0.0
-        else:
-            self.reg_rate = trial.suggest_float('reg_rate', 1e-5, 1e-2, log=True)
+        self.reg_rate = trial.suggest_float('reg_rate', 1e-5, 1e-2, log=True) if self.regularization != 'none' else 0.0
 
-        # Sugestia liczby warstw
+        # Layer configuration
         num_layers = trial.suggest_int('num_layers', 1, 10)
-        # Sugestia liczby neuronów
         units = trial.suggest_int('units', 32, 512, log=True)
-        # Sugestia stopy dropout
         dropout_rate = trial.suggest_float('dropout_rate', 0.0, 0.5)
-
-        # Dodanie opcji Batch Normalization
         use_batch_norm = trial.suggest_categorical('use_batch_norm', [True, False])
 
         layers_list = []
@@ -170,23 +155,35 @@ class Net(nn.Module):
                 layers_list.append(nn.Dropout(dropout_rate))
             in_features = units
 
-        # Warstwa wyjściowa
+        # Output layer
         layers_list.append(nn.Linear(in_features, 1))
-
-        # Składanie warstw w Sequential
         self.model = nn.Sequential(*layers_list)
 
-        # Inicjalizacja wag
-        init_method = trial.suggest_categorical('weight_init', ['xavier', 'kaiming', 'normal'])
-        self.apply(lambda m: self.init_weights(m, init_method))
+        # Weight initialization
+        self.init_method = trial.suggest_categorical('weight_init', ['xavier', 'kaiming', 'normal'])
+        self.apply(self.init_weights)
 
-    def init_weights(self, m, init_method):
+    def get_activation_function(self, name):
+        if name == 'relu':
+            return nn.ReLU()
+        elif name == 'tanh':
+            return nn.Tanh()
+        elif name == 'sigmoid':
+            return nn.Sigmoid()
+        elif name == 'leaky_relu':
+            return nn.LeakyReLU(negative_slope=0.01)
+        elif name == 'selu':
+            return nn.SELU()
+        else:
+            raise ValueError(f"Unsupported activation function: {name}")
+
+    def init_weights(self, m):
         if isinstance(m, nn.Linear):
-            if init_method == 'xavier':
+            if self.init_method == 'xavier':
                 nn.init.xavier_uniform_(m.weight)
-            elif init_method == 'kaiming':
+            elif self.init_method == 'kaiming':
                 nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
-            elif init_method == 'normal':
+            elif self.init_method == 'normal':
                 nn.init.normal_(m.weight, mean=0.0, std=0.05)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
@@ -194,6 +191,19 @@ class Net(nn.Module):
     def forward(self, x):
         return self.model(x)
 
+# Definicja klasy WrappedModel
+class WrappedModel(nn.Module):
+    def __init__(self, model):
+        super(WrappedModel, self).__init__()
+        self.model = model
+        self.model.eval()  # Ustawienie modelu w trybie ewaluacji
+
+    def forward(self, x):
+        if isinstance(x, np.ndarray):
+            x = torch.from_numpy(x)
+        x = x.type(torch.float32)
+        with torch.no_grad():
+            return self.model(x)
 
 def objective(trial, csv_path):
     try:
@@ -263,9 +273,7 @@ def objective(trial, csv_path):
                         outputs = model(batch_X).squeeze()
                         loss = criterion(outputs.view(-1), batch_y)
                     else:
-                        # Jeśli batch ma tylko 1 próbkę, możesz podjąć decyzję, co zrobić
-                        # np. ominąć ten batch lub obsłużyć to w inny sposób
-                        print("Batch size is 1, skipping BatchNorm-related operations.")
+                        # Jeśli batch ma tylko 1 próbkę, pomijamy ten batch
                         continue
 
                     # Dodanie regularizacji
@@ -566,9 +574,47 @@ def train_final_model(csv_path, trial, csv_name):
         # Zapisanie modelu
         model_file_name = f"{csv_name}_final_model.pth"
         torch.save(model.state_dict(), model_file_name)
+        print(f"Model saved as {model_file_name}")
 
-        # Logowanie modelu do MLflow wraz ze środowiskiem Conda
-        mlflow.pytorch.log_model(model, "model")
+        # Przeniesienie modelu na CPU i ustawienie w trybie ewaluacji
+        model.to('cpu')
+        model.eval()
+        model = model.float()
+
+        # Przygotowanie przykładu wejściowego
+        input_example = X_full[0:1].astype(np.float32)  # numpy.ndarray
+
+        # Stworzenie opakowanego modelu
+        wrapped_model = WrappedModel(model)
+
+        # Definicja conda_env lub pip_requirements
+        conda_env = {
+            'channels': ['defaults'],
+            'dependencies': [
+                f'python={sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}',
+                'pip',
+                {
+                    'pip': [
+                        f'torch=={torch.__version__}',
+                        'mlflow',
+                    ],
+                },
+            ],
+            'name': 'mlflow-env'
+        }
+
+        # Ustawienie poziomu logowania na DEBUG
+        import logging
+        logging.getLogger("mlflow").setLevel(logging.DEBUG)
+
+        # Logowanie modelu do MLflow z input_example i conda_env
+        mlflow.pytorch.log_model(
+            wrapped_model,
+            "model",
+            conda_env=conda_env,
+            input_example=input_example
+        )
+        print(f"Model logged to MLflow.")
 
     except Exception as e:
         print(f"Wystąpił błąd podczas trenowania finalnego modelu: {e}")
