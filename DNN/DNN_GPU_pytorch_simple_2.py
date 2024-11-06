@@ -28,6 +28,8 @@ import matplotlib.pyplot as plt
 import json
 from optuna import importance
 
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
 # Importowanie tagów MLflow z pliku tags_config_pytorch.py
 import tags_config_pytorch
 
