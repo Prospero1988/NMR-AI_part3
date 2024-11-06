@@ -11,7 +11,7 @@ mlflow_tags1 = {
 
 mlflow_tags2 = {
     "architecture": "Pytorch",
-    "predictor": "1Hx13C",
+    "predictor": "13_conc_1H",
     "model": "CNN 1D",
     "stage": "evaluation",
     "author": "aleniak",
@@ -22,7 +22,7 @@ mlflow_tags2 = {
 
 mlflow_tags3 = {
     "architecture": "Pytorch",
-    "predictor": "1Hx13C",
+    "predictor": "13_conc_1H",
     "model": "CNN 1D",
     "stage": "training",
     "author": "aleniak",

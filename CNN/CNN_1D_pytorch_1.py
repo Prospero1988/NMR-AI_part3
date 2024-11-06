@@ -31,6 +31,8 @@ from optuna import importance
 # Importowanie tagów MLflow z pliku tags_config_pytorch_CNN_1D.py
 import tags_config_pytorch_CNN_1D
 
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
 # Ustawienie ziarna losowego dla powtarzalności wyników
 SEED = 88
 random.seed(SEED)
@@ -156,7 +158,7 @@ class Net(nn.Module):
         use_batch_norm = trial.suggest_categorical('use_batch_norm', [True, False])
 
         # Convolutional layers
-        num_conv_layers = trial.suggest_int('num_conv_layers', 1, 3)
+        num_conv_layers = trial.suggest_int('num_conv_layers', 2, 5)
         conv_layers = []
         in_channels = 1  # Input channels for Conv1d
         input_length = input_dim  # Initial input length
