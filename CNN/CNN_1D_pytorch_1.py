@@ -165,9 +165,31 @@ class Net(nn.Module):
 
         for i in range(num_conv_layers):
             out_channels = trial.suggest_int(f'num_filters_l{i}', 16, 128, log=True)
-            kernel_size = trial.suggest_int(f'kernel_size_l{i}', 3, 15, step=2)
+
+            # Sugestia padding
+            max_possible_padding = 3  # Możesz dostosować tę wartość
+            padding = trial.suggest_int(f'padding_l{i}', 0, max_possible_padding)
+
+            # Obliczenie maksymalnego kernel_size
+            max_kernel_size = input_length + 2 * padding
+            max_kernel_size = min(max_kernel_size, 15)  # Oryginalny maksymalny kernel_size
+            if max_kernel_size < 3:
+                max_kernel_size = 3  # Minimalny kernel_size
+
+            # Sugestia kernel_size z dostosowanym maksimum
+            kernel_size = trial.suggest_int(f'kernel_size_l{i}', 3, max_kernel_size, step=2)
+
+            # Sugestia stride
             stride = trial.suggest_int(f'stride_l{i}', 1, 3)
-            padding = trial.suggest_int(f'padding_l{i}', 0, 3)
+
+            # Obliczenie output_length
+            numerator = input_length + 2 * padding - (kernel_size - 1) - 1
+            if numerator < 0:
+                continue  # Pomiń tę kombinację hiperparametrów
+
+            output_length = numerator // stride + 1
+            if output_length <= 0:
+                continue  # Pomiń tę kombinację hiperparametrów
 
             conv_layers.append(nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding))
             if use_batch_norm:
@@ -176,11 +198,7 @@ class Net(nn.Module):
             if dropout_rate > 0.0:
                 conv_layers.append(nn.Dropout(dropout_rate))
             in_channels = out_channels
-
-            # Calculate new input length after this layer
-            input_length = int((input_length + 2 * padding - (kernel_size - 1) - 1) / stride + 1)
-            if input_length <= 0:
-                raise ValueError('Negative or zero input length. Adjust kernel_size, stride, or padding.')
+            input_length = output_length  # Aktualizacja długości wejścia
 
         self.conv = nn.Sequential(*conv_layers)
 
