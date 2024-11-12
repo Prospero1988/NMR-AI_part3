@@ -26,6 +26,8 @@ import argparse
 import optuna.visualization.matplotlib as optuna_viz
 import matplotlib.pyplot as plt
 import json
+from sklearn.preprocessing import StandardScaler
+
 from optuna import importance
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -237,6 +239,11 @@ def objective(trial, csv_path):
             X_valid_fold = X_train[valid_index]
             y_train_fold = y_train[train_index]
             y_valid_fold = y_train[valid_index]
+
+            # Normalizacja danych
+            scaler = StandardScaler()
+            X_train_fold = scaler.fit_transform(X_train_fold)
+            X_valid_fold = scaler.transform(X_valid_fold)
 
             # Tworzenie modelu
             input_dim = X_train_fold.shape[1]
