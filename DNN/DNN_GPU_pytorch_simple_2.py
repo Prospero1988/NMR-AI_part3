@@ -567,7 +567,7 @@ def train_final_model(csv_path, trial, csv_name):
         # Trenowanie modelu na całym zbiorze danych
         dataset = torch.utils.data.TensorDataset(torch.tensor(X_full, dtype=torch.float32),
                                                  torch.tensor(y_full, dtype=torch.float32))
-        loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
         for epoch in range(epochs):
             model.train()

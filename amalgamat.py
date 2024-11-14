@@ -1,32 +1,58 @@
-print("\nPrzypadek 1\n")
+import pygame
+import sys
+import random
 
-x = 0.4 + 0.2
-y = 0.6
+# Inicjalizacja Pygame
+pygame.init()
 
-if x == y:
-    print("True")
-else:
-    print("False")
+# Kolory
+BLACK = (0, 0, 0)
+WHITE = (255, 255, 255)
 
-print("\nPrzypadek 2\n")
+# Ustawienia okna
+screen_width = 800
+screen_height = 600
+screen = pygame.display.set_mode((screen_width, screen_height))
+pygame.display.set_caption("DVD Screensaver")
 
-x = 0.4 + 0.3
-y = 0.7
+# Załadowanie obrazu DVD
+dvd_image = pygame.image.load("dvd_logo.png")  # Można pobrać obrazek 'dvd_logo.png'
+dvd_rect = dvd_image.get_rect()
 
-if x == y:
-    print("True")
-else:
-    print("False")
-    
+# Skalowanie obrazu, jeśli jest zbyt duży
+dvd_rect.width = 100
+dvd_rect.height = 50
+dvd_image = pygame.transform.scale(dvd_image, (dvd_rect.width, dvd_rect.height))
 
-print("\nJak sobie z tym poradzić?\n")
+# Pozycja i prędkość
+x, y = random.randint(0, screen_width - dvd_rect.width), random.randint(0, screen_height - dvd_rect.height)
+speed_x, speed_y = 3, 3
 
-import math
+# Obiekt do kontroli FPS
+clock = pygame.time.Clock()
 
-x = 0.4 + 0.3
-y = 0.7
+# Główna pętla programu
+running = True
+while running:
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            pygame.quit()
+            sys.exit()
 
-if math.isclose(x, y, rel_tol=1e-9):
-    print("True")
-else:
-    print("False")
+    # Ruch logo
+    x += speed_x
+    y += speed_y
+
+    # Odbicie od ścian
+    if x <= 0 or x + dvd_rect.width >= screen_width:
+        speed_x = -speed_x
+    if y <= 0 or y + dvd_rect.height >= screen_height:
+        speed_y = -speed_y
+
+    # Czyszczenie ekranu i rysowanie nowej klatki
+    screen.fill(WHITE)
+    screen.blit(dvd_image, (x, y))
+    pygame.display.flip()
+
+    # Kontrola FPS - ustawienie na 60 dla płynności
+    clock.tick(60)
