@@ -416,7 +416,9 @@ def main():
         logger.info("Optuna zakończona. Najlepsze parametry: %s, RMSE=%f", best_params, best_value)
 
         with mlflow.start_run(run_name="HybridCNN_MLP_Optuna_10CV") as run:
-            mlflow.set_tags(MLFLOW_TAGS)
+            run_tags = dict(MLFLOW_TAGS)
+            run_tags["file"] = prefix 
+            mlflow.set_tags(run_tags)
             mlflow.log_params(best_params)
             mlflow.log_param("n_trials", args.n_trials)
             mlflow.log_param("epochs_10cv", args.epochs_10cv)
@@ -446,11 +448,13 @@ def main():
                 json.dump(param_importances, f, indent=2)
             mlflow.log_artifact(json_path)
 
+            # Poprawka: tutaj 'fig_imp' to Axes, więc pobieramy figure:
             fig_imp = optuna_viz.plot_param_importances(study)
+            fig_real = fig_imp.figure
             fig_imp_path = os.path.join(res_dir, "param_importances.png")
-            fig_imp.savefig(fig_imp_path, dpi=300, bbox_inches="tight")
+            fig_real.savefig(fig_imp_path, dpi=300, bbox_inches="tight")
             mlflow.log_artifact(fig_imp_path)
-            plt.close(fig_imp)
+            plt.close(fig_real)
 
             # (3) 10CV
             def best_model_func():
@@ -497,6 +501,16 @@ def main():
             y_pred_all = results["y_pred_all"]
             logger.info("10CV zakończone. RMSE=%.4f±%.4f, MAE=%.4f±%.4f",
                         rmse_mean, rmse_std, mae_mean, mae_std)
+
+            # <-- TU DODAŁEMY LOGOWANIE PARAMETRÓW DO MLflow
+            mlflow.log_param("rmse_mean_10cv", rmse_mean)
+            mlflow.log_param("rmse_std_10cv", rmse_std)
+            mlflow.log_param("mae_mean_10cv", mae_mean)
+            mlflow.log_param("mae_std_10cv", mae_std)
+            mlflow.log_param("r2_mean_10cv", r2_mean)
+            mlflow.log_param("r2_std_10cv", r2_std)
+            mlflow.log_param("pearson_mean_10cv", pearson_mean)
+            mlflow.log_param("pearson_std_10cv", pearson_std)
 
             # Zapis metrics.csv
             metrics_path = os.path.join(res_dir, "metrics.csv")
