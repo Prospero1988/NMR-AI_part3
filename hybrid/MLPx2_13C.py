@@ -1,11 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Skrypt (CNN + MLP) do regresji na danych NMR (¹H + ¹³C) i fingerprintach ECFP4.
+Skrypt (2xMLP) do regresji na danych NMR (¹H lub ¹³C) i fingerprintach ECFP4.
 W trakcie optymalizacji (Optuna) używa 3CV, finalnie 10CV. Logowanie w MLflow,
 lokalny katalog wyników, historia triali Optuny, ważność hiperparametrów,
-wykres błędu i teraz także wykres przebiegu RMSE vs ID triala.
-Dodatkowo logujemy wszystkie komunikaty i ewentualne błędy do pliku w katalogu wynikowym.
+wykres przebiegu RMSE vs ID triala, itp.
 """
 
 import argparse
@@ -35,26 +34,33 @@ import mlflow.pytorch
 from optuna.importance import get_param_importances
 import optuna.visualization.matplotlib as optuna_viz
 
+
 # ---------------------------------------------------------------------------------
-# Tagi MLflow
+# Tagi MLflow (możesz dostosować wedle potrzeby)
 # ---------------------------------------------------------------------------------
 MLFLOW_TAGS = {
     "property": "CHI logD",
-    "model": "hybrid 2DCNN-MLP",
-    "predictor": "1Hx13C+FP"
+    "model": "2xMLP",
+    "predictor": "13C_NMR+FP"
 }
 
 # =================================================================================
 # Dataset
 # =================================================================================
 class NMRFpDataset(Dataset):
+    """
+    Zbiór danych wczytujący:
+    - nmr_data: macierz (N, d_nmr)
+    - fp_data: macierz (N, d_fp)
+    - labels: wektor (N,)
+    """
     def __init__(self, nmr_data, fp_data, labels):
-        self.nmr_data = nmr_data  # (N, 2, 1, 200)
-        self.fp_data = fp_data    # (N, 2048)
+        self.nmr_data = nmr_data  # (N, d_nmr)
+        self.fp_data = fp_data    # (N, d_fp)
         self.labels = labels      # (N,)
 
     def __len__(self):
-        return self.nmr_data.size(0)
+        return self.nmr_data.shape[0]
 
     def __getitem__(self, idx):
         return (
@@ -64,97 +70,115 @@ class NMRFpDataset(Dataset):
         )
 
 
-def load_and_align_data(path_1h, path_13c, path_fp):
-    df_1h = pd.read_csv(path_1h)
-    df_13c = pd.read_csv(path_13c)
+def load_and_align_data(path_nmr, path_fp):
+    """
+    Zakładamy, że `path_nmr` może być plikiem z ¹H lub ¹³C – Ty decydujesz przy uruchomieniu.
+    Zwracamy:
+        x_nmr: shape (N, d_nmr)
+        x_fp:  shape (N, d_fp)
+        y:      shape (N,)
+    """
+    df_nmr = pd.read_csv(path_nmr)
     df_fp = pd.read_csv(path_fp)
 
-    df_1h.columns = ["MOLECULE_NAME", "LABEL"] + [f"h_{i}" for i in range(df_1h.shape[1] - 2)]
-    df_13c.columns = ["MOLECULE_NAME", "LABEL"] + [f"c_{i}" for i in range(df_13c.shape[1] - 2)]
-    df_fp.columns = ["MOLECULE_NAME", "LABEL"] + [f"fp_{i}" for i in range(df_fp.shape[1] - 2)]
+    # Zakładamy, że w plikach jest: MOLECULE_NAME, LABEL, a potem kolumny z wartościami sygnałów lub bitów
+    # Nazwy kolumn w pliku NMR mogą być np. "nmr_0, nmr_1, ..." - tutaj generujemy:
+    nmr_prefix = "nmr_"
+    # Dostosuj do liczby kolumn w df_nmr
+    df_nmr.columns = ["MOLECULE_NAME", "LABEL"] + [f"{nmr_prefix}{i}" for i in range(df_nmr.shape[1] - 2)]
 
-    merged_1h_13c = pd.merge(df_1h, df_13c, on=["MOLECULE_NAME", "LABEL"], how="inner")
-    merged_all = pd.merge(merged_1h_13c, df_fp, on=["MOLECULE_NAME", "LABEL"], how="inner")
+    # Fingerprinty
+    fp_prefix = "fp_"
+    df_fp.columns = ["MOLECULE_NAME", "LABEL"] + [f"{fp_prefix}{i}" for i in range(df_fp.shape[1] - 2)]
 
-    h_cols = [c for c in merged_all.columns if c.startswith("h_")]
-    c_cols = [c for c in merged_all.columns if c.startswith("c_")]
-    fp_cols = [c for c in merged_all.columns if c.startswith("fp_")]
+    # Łączymy we wspólny DataFrame
+    merged_all = pd.merge(df_nmr, df_fp, on=["MOLECULE_NAME", "LABEL"], how="inner")
 
-    x_h = merged_all[h_cols].values  # (N, 200)
-    x_c = merged_all[c_cols].values  # (N, 200)
-    x_fp = merged_all[fp_cols].values
-    y = merged_all["LABEL"].values
+    # Wybieramy nazwy kolumn nmr i fp
+    nmr_cols = [c for c in merged_all.columns if c.startswith(nmr_prefix)]
+    fp_cols = [c for c in merged_all.columns if c.startswith(fp_prefix)]
 
-    x_nmr = np.stack([x_h, x_c], axis=1)  # (N, 2, 200)
+    x_nmr = merged_all[nmr_cols].values  # (N, d_nmr)
+    x_fp = merged_all[fp_cols].values    # (N, d_fp)
+    y = merged_all["LABEL"].values       # (N,)
+
     return x_nmr, x_fp, y
 
 # =================================================================================
-# Moduły sieciowe
+# Moduły sieciowe: 2x MLP
 # =================================================================================
-class CNNModule(nn.Module):
+class MLP_NMR(nn.Module):
+    """
+    MLP do widma NMR (zamiast CNN).
+    """
     def __init__(self, trial):
-        super(CNNModule, self).__init__()
-        num_conv_layers = trial.suggest_int("cnn_num_layers", 1, 5)
-        kernel_size = trial.suggest_int("cnn_kernel_size", 3, 11, step=2)
-        dropout_cnn = trial.suggest_float("cnn_dropout", 0.1, 0.7, step=0.1)
-        batch_norm_on = trial.suggest_categorical("cnn_batch_norm", [True, False])
+        super(MLP_NMR, self).__init__()
+        # Liczba warstw, dropout itp. – parametryzowane przez Optunę
+        num_layers = trial.suggest_int("nmr_num_layers", 1, 5)
+        dropout_nmr = trial.suggest_float("nmr_dropout", 0.0, 0.7, step=0.1)
 
-        conv_layers = []
-        in_channels = 2
-        for i in range(num_conv_layers):
-            out_channels = trial.suggest_int(f"cnn_out_channels_l{i}", 8, 256, log=True)
-            stride = 1
-            padding = 0
-
-            conv_layers.append(nn.Conv2d(in_channels, out_channels,
-                                         kernel_size=(1, kernel_size),
-                                         stride=stride, padding=(0, padding)))
-            conv_layers.append(nn.ReLU(inplace=True))
-            if batch_norm_on:
-                conv_layers.append(nn.BatchNorm2d(out_channels))
-            conv_layers.append(nn.Dropout2d(p=dropout_cnn))
-            in_channels = out_channels
-
-        self.conv = nn.Sequential(*conv_layers)
-        linear_out = trial.suggest_int("cnn_linear_out", 16, 256, log=True)
-        self.fc = nn.Linear(in_channels, linear_out)
-        self.out_features = linear_out
-
-    def forward(self, x):
-        x = self.conv(x)           # (B, out_channels, 1, W')
-        x = torch.mean(x, dim=3)   # global avg pooling -> (B, out_channels, 1)
-        x = x.squeeze(2)           # -> (B, out_channels)
-        x = self.fc(x)             # -> (B, linear_out)
-        return x
-
-class MLPModule(nn.Module):
-    def __init__(self, trial):
-        super(MLPModule, self).__init__()
-        num_layers = trial.suggest_int("mlp_num_layers", 1, 5)
-        dropout_mlp = trial.suggest_float("mlp_dropout", 0.0, 0.7, step=0.1)
+        # Rzeczywisty wymiar wejścia (d_nmr) wczytamy dynamicznie – np. w trakcie tworzenia modelu
+        # trzeba go jednak znać. Tu dajemy placeholder, albo przyjmujemy na sztywno (np. 200).
+        # Dla uniwersalności powiedzmy, że ustawimy in_dim = 200 (jeśli wiesz, że NMR ma 200 pkt).
+        # Możesz też to parametryzować z zewnątrz. Tu dla uproszczenia – "200".
+        in_dim = 200
 
         layers = []
-        in_dim = 2048
         for i in range(num_layers):
-            out_dim = trial.suggest_int(f"mlp_hidden_dim_l{i}", 64, 2048, log=True)
+            out_dim = trial.suggest_int(f"nmr_hidden_dim_l{i}", 32, 1024, log=True)
             layers.append(nn.Linear(in_dim, out_dim))
             layers.append(nn.ReLU(inplace=True))
-            layers.append(nn.Dropout(p=dropout_mlp))
+            layers.append(nn.Dropout(p=dropout_nmr))
             in_dim = out_dim
 
         self.mlp = nn.Sequential(*layers)
         self.out_features = in_dim
 
     def forward(self, x):
+        # x shape: (batch_size, 200)  # jeżeli w NMR mamy 200 punktów
         return self.mlp(x)
 
-class HybridModel(nn.Module):
-    def __init__(self, trial, cnn_module, mlp_module):
-        super(HybridModel, self).__init__()
-        self.cnn = cnn_module
-        self.mlp = mlp_module
 
-        combined_in_dim = self.cnn.out_features + self.mlp.out_features
+class MLP_FP(nn.Module):
+    """
+    MLP do fingerprintów (tak jak poprzednio, ale uproszczony).
+    """
+    def __init__(self, trial):
+        super(MLP_FP, self).__init__()
+        num_layers = trial.suggest_int("fp_num_layers", 1, 5)
+        dropout_fp = trial.suggest_float("fp_dropout", 0.0, 0.7, step=0.1)
+
+        in_dim = 2048  # standardowo fingerprinty ECFP4
+        layers = []
+        for i in range(num_layers):
+            out_dim = trial.suggest_int(f"fp_hidden_dim_l{i}", 64, 2048, log=True)
+            layers.append(nn.Linear(in_dim, out_dim))
+            layers.append(nn.ReLU(inplace=True))
+            layers.append(nn.Dropout(p=dropout_fp))
+            in_dim = out_dim
+
+        self.mlp = nn.Sequential(*layers)
+        self.out_features = in_dim
+
+    def forward(self, x):
+        # x shape: (batch_size, 2048)
+        return self.mlp(x)
+
+
+class TwoMLPModel(nn.Module):
+    """
+    "Sercem" jest to, że mamy MLP do NMR i MLP do FP, a potem łączymy (concat) i kończymy
+    jedną lub dwiema warstwami.
+    """
+    def __init__(self, trial, nmr_module, fp_module):
+        super(TwoMLPModel, self).__init__()
+        self.nmr_mlp = nmr_module
+        self.fp_mlp = fp_module
+
+        # Suma wymiarów wyjściowych
+        combined_in_dim = self.nmr_mlp.out_features + self.fp_mlp.out_features
+
+        # Finalne warstwy
         out_dim = trial.suggest_int("final_hidden_dim", 16, 512, log=True)
         dropout_final = trial.suggest_float("final_dropout", 0.0, 0.7, step=0.1)
 
@@ -162,18 +186,21 @@ class HybridModel(nn.Module):
             nn.Linear(combined_in_dim, out_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(p=dropout_final),
-            nn.Linear(out_dim, 1)
+            nn.Linear(out_dim, 1)  # regresja
         )
 
     def forward(self, x_nmr, x_fp):
-        cnn_out = self.cnn(x_nmr)
-        mlp_out = self.mlp(x_fp)
-        combined = torch.cat([cnn_out, mlp_out], dim=1)
+        # x_nmr: (batch_size, 200)
+        # x_fp:  (batch_size, 2048)
+        nmr_out = self.nmr_mlp(x_nmr)
+        fp_out = self.fp_mlp(x_fp)
+        combined = torch.cat([nmr_out, fp_out], dim=1)
         out = self.final_layers(combined)
-        return out.squeeze(1)
+        return out.squeeze(1)  # (batch_size,)
+
 
 # =================================================================================
-# Pomocnicze funkcje treningowe
+# Funkcje treningowe i cross-validate
 # =================================================================================
 def set_seed(seed=1988):
     np.random.seed(seed)
@@ -224,9 +251,12 @@ def validate(model, loader, loss_fn, device):
     return val_loss / len(loader.dataset), rmse, y_true, y_pred
 
 def create_model_and_optimizer(trial):
-    cnn_module = CNNModule(trial)
-    mlp_module = MLPModule(trial)
-    model = HybridModel(trial, cnn_module, mlp_module)
+    # Tworzymy dwa MLP
+    nmr_module = MLP_NMR(trial)
+    fp_module = MLP_FP(trial)
+
+    # Tworzymy finalny model
+    model = TwoMLPModel(trial, nmr_module, fp_module)
 
     optimizer_name = trial.suggest_categorical("optimizer", ["Adam", "SGD", "RMSProp"])
     lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
@@ -240,9 +270,7 @@ def create_model_and_optimizer(trial):
 
     return model, optimizer
 
-# =================================================================================
-# 10CV
-# =================================================================================
+
 def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epochs=20):
     kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
     indices = np.arange(len(dataset))
@@ -284,6 +312,7 @@ def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epoch
             if patience_counter >= max_patience:
                 break
 
+        # Ostateczna walidacja
         _, val_rmse, y_true_fold, y_pred_fold = validate(model, val_loader, loss_fn, device)
 
         y_true_all.append(y_true_fold)
@@ -313,6 +342,7 @@ def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epoch
         "fold_indices_all": fold_indices_all
     }
     return results
+
 
 # =================================================================================
 # Objective (3CV)
@@ -361,15 +391,15 @@ def objective(trial, dataset, device):
         raise optuna.TrialPruned()
     return avg_rmse
 
+
 # =================================================================================
 # main()
 # =================================================================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--path_1h", required=True)
-    parser.add_argument("--path_13c", required=True)
-    parser.add_argument("--path_fp", required=True)
-    parser.add_argument("--experiment_name", default="HybridNMR_FP_Experiment_3Fold")
+    parser.add_argument("--path_nmr", required=True, help="Ścieżka do pliku z widmem NMR (¹H lub ¹³C).")
+    parser.add_argument("--path_fp", required=True, help="Ścieżka do pliku z fingerprintami ECFP4.")
+    parser.add_argument("--experiment_name", default="TwoMLP_NMR_FP_Experiment_3Fold")
     parser.add_argument("--n_trials", default=20, type=int)
     parser.add_argument("--epochs_10cv", default=30, type=int)
     args = parser.parse_args()
@@ -377,15 +407,15 @@ def main():
     set_seed(42)
     device = get_device()
 
-    # ------------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
     # Katalog wyników i logger
-    # ------------------------------------------------------------------------------
-    filename_1h = os.path.basename(args.path_1h)
-    prefix = filename_1h.split("_")[0]
-    res_dir = prefix + "-results_hybrid"
+    # --------------------------------------------------------------------------
+    filename_nmr = os.path.basename(args.path_nmr)
+    prefix = filename_nmr.split("_")[0]
+    res_dir = prefix + "-results_2xMLP"
     os.makedirs(res_dir, exist_ok=True)
 
-    # Ustawiamy logger, żeby logi poszły też do pliku
+    # Ustawiamy logger, żeby logi szły też do pliku
     log_file = os.path.join(res_dir, "script.log")
     logging.basicConfig(
         level=logging.INFO,
@@ -396,14 +426,16 @@ def main():
         ]
     )
     logger = logging.getLogger(__name__)
-    logger.info("Start skryptu (hybrid). Katalog wynikowy: %s", res_dir)
+    logger.info("Start skryptu (2xMLP). Katalog wynikowy: %s", res_dir)
 
     try:
         logger.info("Uruchomienie na urządzeniu: %s", device)
-        X_nmr, X_fp, y = load_and_align_data(args.path_1h, args.path_13c, args.path_fp)
-        X_nmr_t = torch.from_numpy(X_nmr).float().unsqueeze(2)
+        X_nmr, X_fp, y = load_and_align_data(args.path_nmr, args.path_fp)
+        # Konwersja do tensora float
+        X_nmr_t = torch.from_numpy(X_nmr).float()
         X_fp_t = torch.from_numpy(X_fp).float()
         y_t = torch.from_numpy(y).float()
+
         dataset = NMRFpDataset(X_nmr_t, X_fp_t, y_t)
 
         mlflow.set_experiment(args.experiment_name)
@@ -415,9 +447,9 @@ def main():
         best_value = study.best_value
         logger.info("Optuna zakończona. Najlepsze parametry: %s, RMSE=%f", best_params, best_value)
 
-        with mlflow.start_run(run_name="HybridCNN_MLP_Optuna_10CV") as run:
+        with mlflow.start_run(run_name="TwoMLP_Optuna_10CV") as run:
             run_tags = dict(MLFLOW_TAGS)
-            run_tags["file"] = prefix 
+            run_tags["file"] = prefix
             mlflow.set_tags(run_tags)
             mlflow.log_params(best_params)
             mlflow.log_param("n_trials", args.n_trials)
@@ -435,7 +467,7 @@ def main():
             plt.plot(df_trials["number"], df_trials["value"], marker="o", linestyle="-")
             plt.xlabel("Trial ID")
             plt.ylabel("RMSE (3CV)")
-            plt.title("Optuna: RMSE vs Trial ID (hybrid)")
+            plt.title("Optuna: RMSE vs Trial ID (2xMLP)")
             plt.grid(True)
             plt.savefig(plot_trials_path, dpi=300, bbox_inches="tight")
             mlflow.log_artifact(plot_trials_path)
@@ -448,7 +480,6 @@ def main():
                 json.dump(param_importances, f, indent=2)
             mlflow.log_artifact(json_path)
 
-            # Poprawka: tutaj 'fig_imp' to Axes, więc pobieramy figure:
             fig_imp = optuna_viz.plot_param_importances(study)
             fig_real = fig_imp.figure
             fig_imp_path = os.path.join(res_dir, "param_importances.png")
@@ -456,7 +487,7 @@ def main():
             mlflow.log_artifact(fig_imp_path)
             plt.close(fig_real)
 
-            # (3) 10CV
+            # (3) 10CV z najlepszymi parametrami
             def best_model_func():
                 class FrozenTrialStub:
                     def suggest_int(self, name, low, high, step=None, log=False):
@@ -467,7 +498,7 @@ def main():
                         return best_params[name]
 
                 trial_stub = FrozenTrialStub()
-                model = HybridModel(trial_stub, CNNModule(trial_stub), MLPModule(trial_stub))
+                model = TwoMLPModel(trial_stub, MLP_NMR(trial_stub), MLP_FP(trial_stub))
                 optimizer_name = best_params["optimizer"]
                 lr = best_params["lr"]
                 if optimizer_name == "Adam":
@@ -502,7 +533,7 @@ def main():
             logger.info("10CV zakończone. RMSE=%.4f±%.4f, MAE=%.4f±%.4f",
                         rmse_mean, rmse_std, mae_mean, mae_std)
 
-            # <-- TU DODAŁEMY LOGOWANIE PARAMETRÓW DO MLflow
+            # Zapis metryk do MLflow
             mlflow.log_metric("rmse_mean_10cv", rmse_mean)
             mlflow.log_metric("rmse_std_10cv", rmse_std)
             mlflow.log_metric("mae_mean_10cv", mae_mean)
@@ -547,7 +578,7 @@ def main():
             plt.scatter(y_true_all, y_pred_all, alpha=0.5)
             plt.xlabel("Rzeczywiste y")
             plt.ylabel("Przewidywane y")
-            plt.title("Hybrid Model: Real vs. Pred (10CV)")
+            plt.title("Two MLP Model: Real vs. Pred (10CV)")
             plt.savefig(plot_path, dpi=300, bbox_inches="tight")
             mlflow.log_artifact(plot_path)
             plt.close()
@@ -564,7 +595,7 @@ def main():
             mlflow.log_artifact(error_plot)
             plt.close()
 
-            # Trening finalny model na CAŁYM zbiorze
+            # (4) Trening finalny model na CAŁYM zbiorze
             final_model, final_optimizer = best_model_func()
             final_model.to(device)
             loss_fn = nn.MSELoss()
@@ -584,6 +615,7 @@ def main():
                 if patience_counter >= max_patience:
                     break
 
+            # Zapis finalnego modelu w MLflow
             mlflow.pytorch.log_model(final_model, artifact_path="model")
 
             mlflow.end_run()
@@ -591,7 +623,7 @@ def main():
         logger.info("Skrypt zakończył się sukcesem.")
 
     except Exception as e:
-        logger.exception("Błąd w trakcie działania skryptu (hybrid).")
+        logger.exception("Błąd w trakcie działania skryptu (2xMLP).")
         sys.exit(1)
 
 
