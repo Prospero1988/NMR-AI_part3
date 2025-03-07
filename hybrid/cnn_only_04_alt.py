@@ -1,11 +1,13 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Skrypt (tylko CNN 2D) do regresji na danych NMR (¹H + ¹³C).
+Skrypt (tylko CNN 2D) do regresji na danych NMR (¹H + ¹³C),
+ale w alternatywnym formacie danych:
+(N, 1, 2, 200), czyli 1 kanał, wysokość=2, szerokość=200.
+
 W trakcie optymalizacji (Optuna) używa 3CV, finalnie 10CV. Logowanie w MLflow,
 lokalny katalog wyników, historia triali Optuny, ważność hiperparametrów,
 wykres błędu i wykres RMSE vs ID triala.
-Dodatkowo logujemy wszystkie komunikaty i błędy do pliku w katalogu wynikowym.
 """
 
 import argparse
@@ -35,12 +37,13 @@ import mlflow.pytorch
 from optuna.importance import get_param_importances
 import optuna.visualization.matplotlib as optuna_viz
 
+
 # ---------------------------------------------------------------------------------
 # Tagi MLflow (opcjonalnie)
 # ---------------------------------------------------------------------------------
 MLFLOW_TAGS = {
     "property": "CHI logD",
-    "model": "CNN-only 2D",
+    "model": "CNN-only 2D (alt data format)",
     "predictor": "1Hx13C"
 }
 
@@ -48,8 +51,11 @@ MLFLOW_TAGS = {
 # Dataset
 # =================================================================================
 class NMRDataset(Dataset):
+    """
+    Dataset przyjmuje tensory o kształcie (N, 1, 2, 200).
+    """
     def __init__(self, nmr_data, labels):
-        self.nmr_data = nmr_data  # (N, 2, 1, 200)
+        self.nmr_data = nmr_data  # (N, 1, 2, 200)
         self.labels = labels      # (N,)
 
     def __len__(self):
@@ -60,6 +66,12 @@ class NMRDataset(Dataset):
 
 
 def load_nmr_data(path_1h, path_13c):
+    """
+    Ładuje i łączy dane ¹H i ¹³C w jeden tensor o kształcie (N, 1, 2, 200).
+    - "wysokość" = 2 (rząd 1: ¹H, rząd 2: ¹³C)
+    - "szerokość" = 200
+    - 1 kanał (channel=1)
+    """
     df_1h = pd.read_csv(path_1h)
     df_13c = pd.read_csv(path_13c)
 
@@ -73,41 +85,69 @@ def load_nmr_data(path_1h, path_13c):
 
     x_h = merged[h_cols].values  # (N, 200)
     x_c = merged[c_cols].values  # (N, 200)
-    x_nmr = np.stack([x_h, x_c], axis=1)  # (N, 2, 200)
+
+    # Kształt po stackowaniu: (N, 2, 200)
+    x_nmr = np.stack([x_h, x_c], axis=1)
+
+    # Zmieniamy na (N, 1, 2, 200) => 1 kanał, "wysokość" = 2, "szerokość" = 200
+    x_nmr = x_nmr[:, np.newaxis, :, :]  # dodajemy wymiar kanałów na pozycji 1
+
     y = merged["LABEL"].values
     return x_nmr, y
 
 # =================================================================================
-# Model CNN
+# Model CNN - alternatywny kształt danych
 # =================================================================================
-class CNN2D(nn.Module):
+class CNN2DAlt(nn.Module):
+    """
+    W tej wersji in_channels=1, a kernel_size=(2, kernel_size_w),
+    aby filtr zawsze obejmował obie "linie" (¹H i ¹³C) w pionie.
+    """
     def __init__(self, trial):
-        super(CNN2D, self).__init__()
+        super(CNN2DAlt, self).__init__()
+
+        # Liczba splotów w sekwencji
         num_conv_layers = trial.suggest_int("cnn_num_layers", 1, 6)
-        kernel_size = trial.suggest_int("cnn_kernel_size", 3, 13, step=2)
+
+        # Kernel w poziomie (w pionie ustalamy na 2, bo mamy 2 "wiersze")
+        kernel_size_w = trial.suggest_int("cnn_kernel_size", 3, 13, step=2)
+
         dropout_cnn = trial.suggest_float("cnn_dropout", 0.1, 0.6, step=0.1)
         batch_norm_on = trial.suggest_categorical("cnn_batch_norm", [True, False])
 
         conv_layers = []
-        in_channels = 2
+        # in_channels = 1, bo teraz jest jeden "kanał"
+        in_channels = 1
+
         for i in range(num_conv_layers):
             out_channels = trial.suggest_int(f"cnn_out_channels_l{i}", 8, 256, log=True)
             stride = 1
             padding = 0
 
-            conv_layers.append(nn.Conv2d(in_channels, out_channels,
-                                         kernel_size=(1, kernel_size),
-                                         stride=stride, padding=(0, padding)))
+            # kernel_size=(2, kernel_size_w)
+            conv_layers.append(
+                nn.Conv2d(
+                    in_channels, 
+                    out_channels,
+                    kernel_size=(2, kernel_size_w),
+                    stride=stride, 
+                    padding=(0, padding)
+                )
+            )
             conv_layers.append(nn.SiLU(inplace=True))
             if batch_norm_on:
                 conv_layers.append(nn.BatchNorm2d(out_channels))
             conv_layers.append(nn.Dropout2d(p=dropout_cnn))
+
             in_channels = out_channels
 
         self.conv = nn.Sequential(*conv_layers)
+
+        # warstwa liniowa po global avg pooling
         linear_out = trial.suggest_int("cnn_linear_out", 16, 256, log=True)
         self.fc_conv = nn.Linear(in_channels, linear_out)
 
+        # warstwa finalna
         out_dim = trial.suggest_int("final_hidden_dim", 16, 512, log=True)
         dropout_final = trial.suggest_float("final_dropout", 0.0, 0.6, step=0.1)
 
@@ -119,13 +159,21 @@ class CNN2D(nn.Module):
         )
 
     def forward(self, x):
-        # x: (B, 2, 1, 200)
-        x = self.conv(x)          # (B, out_channels, 1, W')
-        x = torch.mean(x, dim=3)  # global avg pooling -> (B, out_channels, 1)
-        x = x.squeeze(2)          # -> (B, out_channels)
-        x = self.fc_conv(x)       # -> (B, linear_out)
+        # x kształt: (B, 1, 2, 200)
+        x = self.conv(x)          
+        # Po splotach: (B, out_channels, H', W') 
+        # a że H'= (2 - 2 + 1)=1 => H'=1 (bez paddingu), W' zależy od kernel_size_w
+
+        # Global Average Pooling - uśredniamy po szerokości
+        x = torch.mean(x, dim=3)  # (B, out_channels, H'=1)
+
+        # Ściśnij wymiar wysokości (1)
+        x = x.squeeze(2)          # => (B, out_channels)
+
+        x = self.fc_conv(x)       # => (B, linear_out)
         out = self.final_layers(x)
         return out.squeeze(1)
+
 
 # =================================================================================
 # Pomocnicze funkcje
@@ -177,7 +225,7 @@ def validate(model, loader, loss_fn, device):
     return val_loss / len(loader.dataset), rmse, y_true, y_pred
 
 def create_model_and_optimizer(trial):
-    model = CNN2D(trial)
+    model = CNN2DAlt(trial)
     optimizer_name = trial.suggest_categorical("optimizer", ["Adam", "SGD", "RMSProp"])
     lr = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
 
@@ -264,7 +312,7 @@ def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epoch
     return results
 
 # =================================================================================
-# Objective (3CV) - CNNOnly
+# Objective (3CV) - CNNOnly (alt data shape)
 # =================================================================================
 def objective(trial, dataset, device):
     batch_size = trial.suggest_int("batch_size", 16, 256, log=True)
@@ -317,7 +365,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--path_1h", required=True)
     parser.add_argument("--path_13c", required=True)
-    parser.add_argument("--experiment_name", default="CNNOnly_Experiment")
+    parser.add_argument("--experiment_name", default="CNNOnly_AltData_Experiment")
     parser.add_argument("--n_trials", default=20, type=int)
     parser.add_argument("--epochs_10cv", default=50, type=int)
     args = parser.parse_args()
@@ -325,16 +373,15 @@ def main():
     set_seed(1988)
     device = get_device()
 
-    # ------------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
     # Katalog wyników i logger
-    # ------------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
     filename_1h = os.path.basename(args.path_1h)
     prefix = filename_1h.split("_")[0]
-    res_dir = prefix + "-results-cnnonly"
+    res_dir = prefix + "-results-cnnonly-alt"
     os.makedirs(res_dir, exist_ok=True)
 
-    # Logger do pliku + stdout
-    log_file = os.path.join(res_dir, "script_cnnonly.log")
+    log_file = os.path.join(res_dir, "script_cnnonly_alt.log")
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -344,13 +391,17 @@ def main():
         ]
     )
     logger = logging.getLogger(__name__)
-    logger.info("Start skryptu (CNNOnly). Katalog wynikowy: %s", res_dir)
+    logger.info("Start skryptu (CNNOnly, alt). Katalog wynikowy: %s", res_dir)
 
     try:
         logger.info("Uruchomienie na urządzeniu: %s", device)
         X_nmr, y = load_nmr_data(args.path_1h, args.path_13c)
-        X_nmr_t = torch.from_numpy(X_nmr).float().unsqueeze(2)
+        # Teraz X_nmr ma kształt (N, 1, 2, 200)
+
+        # Tworzymy tensory
+        X_nmr_t = torch.from_numpy(X_nmr).float()  # bez unsqueeze, bo mamy już (N,1,2,200)
         y_t = torch.from_numpy(y).float()
+
         dataset = NMRDataset(X_nmr_t, y_t)
 
         mlflow.set_experiment(args.experiment_name)
@@ -362,7 +413,7 @@ def main():
         best_value = study.best_value
         logger.info("Optuna zakończona. Najlepsze parametry: %s, RMSE=%f", best_params, best_value)
 
-        with mlflow.start_run(run_name="CNNOnly_10CV") as run:
+        with mlflow.start_run(run_name="CNNOnly_10CV_AltData") as run:
             run_tags = dict(MLFLOW_TAGS)
             run_tags["file"] = prefix 
             mlflow.set_tags(run_tags)
@@ -372,17 +423,17 @@ def main():
 
             # (1) Historia triali
             df_trials = study.trials_dataframe(attrs=("number", "value", "params", "state"))
-            csv_optuna = os.path.join(res_dir, "optuna_trials_cnnonly.csv")
+            csv_optuna = os.path.join(res_dir, "optuna_trials_cnnonly_alt.csv")
             df_trials.to_csv(csv_optuna, index=False)
             mlflow.log_artifact(csv_optuna)
 
-            # Wykres RMSE vs. Trial ID
-            plot_trials_path = os.path.join(res_dir, "optuna_trials_rmse_cnnonly.png")
+            # Wykres RMSE vs Trial ID
+            plot_trials_path = os.path.join(res_dir, "optuna_trials_rmse_cnnonly_alt.png")
             fig = plt.figure()
             plt.plot(df_trials["number"], df_trials["value"], marker="o", linestyle="-")
             plt.xlabel("Trial ID")
             plt.ylabel("RMSE (3CV)")
-            plt.title("Optuna: RMSE vs Trial ID (CNNOnly)")
+            plt.title("Optuna: RMSE vs Trial ID (CNNOnly, alt)")
             plt.grid(True)
             plt.savefig(plot_trials_path, dpi=300, bbox_inches="tight")
             mlflow.log_artifact(plot_trials_path)
@@ -390,20 +441,19 @@ def main():
 
             # (2) Ważność hiperparametrów
             param_importances = get_param_importances(study)
-            json_path = os.path.join(res_dir, "param_importances_cnnonly.json")
+            json_path = os.path.join(res_dir, "param_importances_cnnonly_alt.json")
             with open(json_path, "w") as f:
                 json.dump(param_importances, f, indent=2)
             mlflow.log_artifact(json_path)
 
-            # Poprawka: tutaj 'fig_imp' to Axes, więc pobieramy figure:
             fig_imp = optuna_viz.plot_param_importances(study)
             fig_real = fig_imp.figure
-            fig_imp_path = os.path.join(res_dir, "param_importances.png")
+            fig_imp_path = os.path.join(res_dir, "param_importances_cnnonly_alt.png")
             fig_real.savefig(fig_imp_path, dpi=300, bbox_inches="tight")
             mlflow.log_artifact(fig_imp_path)
             plt.close(fig_real)
 
-            # (3) 10CV
+            # (3) 10CV z najlepszymi parametrami
             def best_model_func():
                 class FrozenTrialStub:
                     def suggest_int(self, name, low, high, step=None, log=False):
@@ -414,7 +464,7 @@ def main():
                         return best_params[name]
 
                 trial_stub = FrozenTrialStub()
-                model = CNN2D(trial_stub)
+                model = CNN2DAlt(trial_stub)
                 optimizer_name = best_params["optimizer"]
                 lr = best_params["lr"]
                 if optimizer_name == "Adam":
@@ -449,7 +499,6 @@ def main():
             logger.info("10CV zakończone. RMSE=%.4f±%.4f, MAE=%.4f±%.4f",
                         rmse_mean, rmse_std, mae_mean, mae_std)
 
-            # <-- TU DODAŁEMY LOGOWANIE PARAMETRÓW DO MLflow
             mlflow.log_param("rmse_mean_10cv", rmse_mean)
             mlflow.log_param("rmse_std_10cv", rmse_std)
             mlflow.log_param("mae_mean_10cv", mae_mean)
@@ -460,7 +509,7 @@ def main():
             mlflow.log_param("pearson_std_10cv", pearson_std)
 
             # Zapis metrics
-            metrics_path = os.path.join(res_dir, "metrics_cnnonly.csv")
+            metrics_path = os.path.join(res_dir, "metrics_cnnonly_alt.csv")
             with open(metrics_path, "w") as f:
                 f.write("metric,mean,std\n")
                 f.write(f"rmse,{rmse_mean},{rmse_std}\n")
@@ -470,7 +519,7 @@ def main():
             mlflow.log_artifact(metrics_path)
 
             # hyperparams
-            hyperparams_path = os.path.join(res_dir, "hyperparams_cnnonly.csv")
+            hyperparams_path = os.path.join(res_dir, "hyperparams_cnnonly_alt.csv")
             with open(hyperparams_path, "w") as f:
                 f.write("param,value\n")
                 for k, v in best_params.items():
@@ -484,29 +533,29 @@ def main():
                 "y_true": y_true_all,
                 "y_pred": y_pred_all
             })
-            cv_csv_path = os.path.join(res_dir, "cv_predictions_cnnonly.csv")
+            cv_csv_path = os.path.join(res_dir, "cv_predictions_cnnonly_alt.csv")
             df_cv.to_csv(cv_csv_path, index=False)
             mlflow.log_artifact(cv_csv_path)
 
             # Wykres y_true vs y_pred
-            plot_path = os.path.join(res_dir, "real_vs_pred_plot_cnnonly.png")
+            plot_path = os.path.join(res_dir, "real_vs_pred_plot_cnnonly_alt.png")
             plt.figure(figsize=(6,6))
             plt.scatter(y_true_all, y_pred_all, alpha=0.5)
             plt.xlabel("Rzeczywiste y")
             plt.ylabel("Przewidywane y")
-            plt.title("CNNOnly: Real vs. Pred (10CV)")
+            plt.title("CNNOnly (alt data): Real vs. Pred (10CV)")
             plt.savefig(plot_path, dpi=300, bbox_inches="tight")
             mlflow.log_artifact(plot_path)
             plt.close()
 
-            # Wykres błędu: X=y_true, Y=|y_true - y_pred|
-            error_plot = os.path.join(res_dir, "error_plot_cnnonly.png")
+            # Wykres błędu
+            error_plot = os.path.join(res_dir, "error_plot_cnnonly_alt.png")
             plt.figure(figsize=(6,6))
             abs_error = np.abs(y_true_all - y_pred_all)
             plt.scatter(y_true_all, abs_error, alpha=0.5)
             plt.xlabel("Rzeczywiste y")
             plt.ylabel("|y_true - y_pred|")
-            plt.title("Błąd bezwzględny vs. y_true (10CV) - CNNOnly")
+            plt.title("Błąd bezwzględny vs. y_true (10CV) - CNNOnly alt")
             plt.savefig(error_plot, dpi=300, bbox_inches="tight")
             mlflow.log_artifact(error_plot)
             plt.close()
@@ -531,15 +580,14 @@ def main():
                 if patience_counter >= max_patience:
                     break
 
-            mlflow.pytorch.log_model(final_model, artifact_path="model_cnnonly")
+            mlflow.pytorch.log_model(final_model, artifact_path="model_cnnonly_alt")
 
             mlflow.end_run()
 
-        logger.info("Skrypt (CNNOnly) zakończył się sukcesem.")
+        logger.info("Skrypt (CNNOnly, alt) zakończył się sukcesem.")
 
     except Exception as e:
-        logger = logging.getLogger(__name__)
-        logger.exception("Błąd w trakcie działania skryptu (CNNOnly).")
+        logger.exception("Błąd w trakcie działania skryptu (CNNOnly, alt).")
         sys.exit(1)
 
 

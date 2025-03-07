@@ -94,9 +94,9 @@ def load_and_align_data(path_1h, path_13c, path_fp):
 class CNNModule(nn.Module):
     def __init__(self, trial):
         super(CNNModule, self).__init__()
-        num_conv_layers = trial.suggest_int("cnn_num_layers", 1, 5)
-        kernel_size = trial.suggest_int("cnn_kernel_size", 3, 11, step=2)
-        dropout_cnn = trial.suggest_float("cnn_dropout", 0.1, 0.7, step=0.1)
+        num_conv_layers = trial.suggest_int("cnn_num_layers", 1, 6)
+        kernel_size = trial.suggest_int("cnn_kernel_size", 3, 13, step=2)
+        dropout_cnn = trial.suggest_float("cnn_dropout", 0.1, 0.6, step=0.1)
         batch_norm_on = trial.suggest_categorical("cnn_batch_norm", [True, False])
 
         conv_layers = []
@@ -109,7 +109,7 @@ class CNNModule(nn.Module):
             conv_layers.append(nn.Conv2d(in_channels, out_channels,
                                          kernel_size=(1, kernel_size),
                                          stride=stride, padding=(0, padding)))
-            conv_layers.append(nn.ReLU(inplace=True))
+            conv_layers.append(nn.SiLU(inplace=True))
             if batch_norm_on:
                 conv_layers.append(nn.BatchNorm2d(out_channels))
             conv_layers.append(nn.Dropout2d(p=dropout_cnn))
@@ -130,15 +130,15 @@ class CNNModule(nn.Module):
 class MLPModule(nn.Module):
     def __init__(self, trial):
         super(MLPModule, self).__init__()
-        num_layers = trial.suggest_int("mlp_num_layers", 1, 5)
-        dropout_mlp = trial.suggest_float("mlp_dropout", 0.0, 0.7, step=0.1)
+        num_layers = trial.suggest_int("mlp_num_layers", 1, 6)
+        dropout_mlp = trial.suggest_float("mlp_dropout", 0.0, 0.6, step=0.1)
 
         layers = []
         in_dim = 2048
         for i in range(num_layers):
             out_dim = trial.suggest_int(f"mlp_hidden_dim_l{i}", 64, 2048, log=True)
             layers.append(nn.Linear(in_dim, out_dim))
-            layers.append(nn.ReLU(inplace=True))
+            layers.append(nn.SiLU(inplace=True))
             layers.append(nn.Dropout(p=dropout_mlp))
             in_dim = out_dim
 
@@ -156,11 +156,11 @@ class HybridModel(nn.Module):
 
         combined_in_dim = self.cnn.out_features + self.mlp.out_features
         out_dim = trial.suggest_int("final_hidden_dim", 16, 512, log=True)
-        dropout_final = trial.suggest_float("final_dropout", 0.0, 0.7, step=0.1)
+        dropout_final = trial.suggest_float("final_dropout", 0.0, 0.6, step=0.1)
 
         self.final_layers = nn.Sequential(
             nn.Linear(combined_in_dim, out_dim),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Dropout(p=dropout_final),
             nn.Linear(out_dim, 1)
         )
@@ -229,7 +229,7 @@ def create_model_and_optimizer(trial):
     model = HybridModel(trial, cnn_module, mlp_module)
 
     optimizer_name = trial.suggest_categorical("optimizer", ["Adam", "SGD", "RMSProp"])
-    lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
+    lr = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
 
     if optimizer_name == "Adam":
         optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -243,7 +243,7 @@ def create_model_and_optimizer(trial):
 # =================================================================================
 # 10CV
 # =================================================================================
-def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epochs=20):
+def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epochs=50):
     kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
     indices = np.arange(len(dataset))
 
@@ -319,7 +319,7 @@ def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epoch
 # =================================================================================
 def objective(trial, dataset, device):
     batch_size = trial.suggest_int("batch_size", 16, 256, log=True)
-    max_epochs = 30
+    max_epochs = 50
 
     kf = KFold(n_splits=3, shuffle=True, random_state=123)
     indices = np.arange(len(dataset))
@@ -371,10 +371,10 @@ def main():
     parser.add_argument("--path_fp", required=True)
     parser.add_argument("--experiment_name", default="HybridNMR_FP_Experiment_3Fold")
     parser.add_argument("--n_trials", default=20, type=int)
-    parser.add_argument("--epochs_10cv", default=30, type=int)
+    parser.add_argument("--epochs_10cv", default=50, type=int)
     args = parser.parse_args()
 
-    set_seed(42)
+    set_seed(1988)
     device = get_device()
 
     # ------------------------------------------------------------------------------

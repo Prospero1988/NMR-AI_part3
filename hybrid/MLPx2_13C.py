@@ -114,8 +114,8 @@ class MLP_NMR(nn.Module):
     def __init__(self, trial):
         super(MLP_NMR, self).__init__()
         # Liczba warstw, dropout itp. – parametryzowane przez Optunę
-        num_layers = trial.suggest_int("nmr_num_layers", 1, 5)
-        dropout_nmr = trial.suggest_float("nmr_dropout", 0.0, 0.7, step=0.1)
+        num_layers = trial.suggest_int("nmr_num_layers", 1, 6)
+        dropout_nmr = trial.suggest_float("nmr_dropout", 0.0, 0.6, step=0.1)
 
         # Rzeczywisty wymiar wejścia (d_nmr) wczytamy dynamicznie – np. w trakcie tworzenia modelu
         # trzeba go jednak znać. Tu dajemy placeholder, albo przyjmujemy na sztywno (np. 200).
@@ -127,7 +127,7 @@ class MLP_NMR(nn.Module):
         for i in range(num_layers):
             out_dim = trial.suggest_int(f"nmr_hidden_dim_l{i}", 32, 1024, log=True)
             layers.append(nn.Linear(in_dim, out_dim))
-            layers.append(nn.ReLU(inplace=True))
+            layers.append(nn.SiLU(inplace=True))
             layers.append(nn.Dropout(p=dropout_nmr))
             in_dim = out_dim
 
@@ -145,15 +145,15 @@ class MLP_FP(nn.Module):
     """
     def __init__(self, trial):
         super(MLP_FP, self).__init__()
-        num_layers = trial.suggest_int("fp_num_layers", 1, 5)
-        dropout_fp = trial.suggest_float("fp_dropout", 0.0, 0.7, step=0.1)
+        num_layers = trial.suggest_int("fp_num_layers", 1, 6)
+        dropout_fp = trial.suggest_float("fp_dropout", 0.0, 0.6, step=0.1)
 
         in_dim = 2048  # standardowo fingerprinty ECFP4
         layers = []
         for i in range(num_layers):
             out_dim = trial.suggest_int(f"fp_hidden_dim_l{i}", 64, 2048, log=True)
             layers.append(nn.Linear(in_dim, out_dim))
-            layers.append(nn.ReLU(inplace=True))
+            layers.append(nn.SiLU(inplace=True))
             layers.append(nn.Dropout(p=dropout_fp))
             in_dim = out_dim
 
@@ -180,11 +180,11 @@ class TwoMLPModel(nn.Module):
 
         # Finalne warstwy
         out_dim = trial.suggest_int("final_hidden_dim", 16, 512, log=True)
-        dropout_final = trial.suggest_float("final_dropout", 0.0, 0.7, step=0.1)
+        dropout_final = trial.suggest_float("final_dropout", 0.0, 0.6, step=0.1)
 
         self.final_layers = nn.Sequential(
             nn.Linear(combined_in_dim, out_dim),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Dropout(p=dropout_final),
             nn.Linear(out_dim, 1)  # regresja
         )
@@ -259,7 +259,7 @@ def create_model_and_optimizer(trial):
     model = TwoMLPModel(trial, nmr_module, fp_module)
 
     optimizer_name = trial.suggest_categorical("optimizer", ["Adam", "SGD", "RMSProp"])
-    lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
+    lr = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
 
     if optimizer_name == "Adam":
         optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -271,7 +271,7 @@ def create_model_and_optimizer(trial):
     return model, optimizer
 
 
-def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epochs=20):
+def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epochs=50):
     kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
     indices = np.arange(len(dataset))
 
@@ -349,7 +349,7 @@ def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epoch
 # =================================================================================
 def objective(trial, dataset, device):
     batch_size = trial.suggest_int("batch_size", 16, 256, log=True)
-    max_epochs = 30
+    max_epochs = 50
 
     kf = KFold(n_splits=3, shuffle=True, random_state=123)
     indices = np.arange(len(dataset))
@@ -401,10 +401,10 @@ def main():
     parser.add_argument("--path_fp", required=True, help="Ścieżka do pliku z fingerprintami ECFP4.")
     parser.add_argument("--experiment_name", default="TwoMLP_NMR_FP_Experiment_3Fold")
     parser.add_argument("--n_trials", default=20, type=int)
-    parser.add_argument("--epochs_10cv", default=30, type=int)
+    parser.add_argument("--epochs_10cv", default=50, type=int)
     args = parser.parse_args()
 
-    set_seed(42)
+    set_seed(1988)
     device = get_device()
 
     # --------------------------------------------------------------------------
