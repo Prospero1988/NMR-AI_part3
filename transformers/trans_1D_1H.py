@@ -1,11 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Skrypt (tylko CNN 2D) do regresji na danych NMR (¹H + ¹³C).
-W trakcie optymalizacji (Optuna) używa 3CV, finalnie 10CV. Logowanie w MLflow,
-lokalny katalog wyników, historia triali Optuny, ważność hiperparametrów,
-wykres błędu i wykres RMSE vs ID triala.
-Dodatkowo logujemy wszystkie komunikaty i błędy do pliku w katalogu wynikowym.
+Przykład: Transformer 1D dla pojedynczego kanału widma (np. tylko ¹H).
+Dodatkowo: Positional Encoding.
 """
 
 import argparse
@@ -34,22 +31,27 @@ import mlflow.pytorch
 
 from optuna.importance import get_param_importances
 import optuna.visualization.matplotlib as optuna_viz
+import math
 
 # ---------------------------------------------------------------------------------
 # Tagi MLflow (opcjonalnie)
 # ---------------------------------------------------------------------------------
 MLFLOW_TAGS = {
     "property": "CHI logD",
-    "model": "CNN-only 2D",
-    "predictor": "1Hx13C"
+    "model": "Transformer 1D (Single Channel + PE)",
+    "predictor": "1H"
 }
+
 
 # =================================================================================
 # Dataset
 # =================================================================================
 class NMRDataset(Dataset):
+    """
+    Dataset dla pojedynczego widma: kształt (N, 1, 1, 200).
+    """
     def __init__(self, nmr_data, labels):
-        self.nmr_data = nmr_data  # (N, 2, 1, 200)
+        self.nmr_data = nmr_data  # (N,1,1,200)
         self.labels = labels      # (N,)
 
     def __len__(self):
@@ -59,76 +61,149 @@ class NMRDataset(Dataset):
         return self.nmr_data[idx], self.labels[idx]
 
 
-def load_nmr_data(path_1h, path_13c):
+def load_nmr_data_single(path_1h):
+    """
+    Ładuje dane TYLKO ¹H w formacie (N, 1, 1, 200):
+    - Zakładamy, że plik CSV zawiera kolumny:
+      [MOLECULE_NAME, LABEL, h_0, h_1, ..., h_199]
+    """
     df_1h = pd.read_csv(path_1h)
-    df_13c = pd.read_csv(path_13c)
+    df_1h.columns = ["MOLECULE_NAME", "LABEL"] + [f"FEATURE_{i}" for i in range(df_1h.shape[1] - 2)]
 
-    df_1h.columns = ["MOLECULE_NAME", "LABEL"] + [f"h_{i}" for i in range(df_1h.shape[1] - 2)]
-    df_13c.columns = ["MOLECULE_NAME", "LABEL"] + [f"c_{i}" for i in range(df_13c.shape[1] - 2)]
+    x_h = df_1h[[f"FEATURE_{i}" for i in range(200)]].values  # (N, 200)
+    y = df_1h["LABEL"].values
 
-    merged = pd.merge(df_1h, df_13c, on=["MOLECULE_NAME", "LABEL"], how="inner")
+    # Chcemy kształt (N,1,1,200): 1 kanał, "wysokość"=1, "szerokość"=200
+    x_h = x_h[:, np.newaxis, np.newaxis, :]  # => (N,1,1,200)
+    return x_h, y
 
-    h_cols = [c for c in merged.columns if c.startswith("h_")]
-    c_cols = [c for c in merged.columns if c.startswith("c_")]
-
-    x_h = merged[h_cols].values  # (N, 200)
-    x_c = merged[c_cols].values  # (N, 200)
-    x_nmr = np.stack([x_h, x_c], axis=1)  # (N, 2, 200)
-    y = merged["LABEL"].values
-    return x_nmr, y
 
 # =================================================================================
-# Model CNN
+# Positional Encoding
 # =================================================================================
-class CNN2D(nn.Module):
+class PositionalEncoding(nn.Module):
+    """
+    Klasyczna implementacja sinusoidalnego positional encodingu.
+    Zakłada, że d_model jest parzyste (lub obsłużymy odpowiednio tablice),
+    ale tutaj głównie wymuszamy z zewnątrz parzyste d_model, aby uniknąć kłopotów.
+    """
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * 
+                             -(math.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+
+        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
+        self.register_buffer('pe', pe)  # nie jest to parametr, raczej stała
+
+    def forward(self, x):
+        """
+        x shape: (B, seq_len, d_model)
+        Dodajemy wektor PE do x.
+        """
+        seq_len = x.size(1)
+        x = x + self.pe[:, :seq_len, :]
+        return x
+
+
+
+# =================================================================================
+# Model Transformer 1D (1 kanał + PE)
+# =================================================================================
+class TransformerRegressorSingle(nn.Module):
+    """
+    - Wejście: (B,1,1,200) => 
+               => .view(B,1,200) => .transpose(1,2) => (B,200,1)
+    - Embedding (1 -> d_model)
+    - Dodajemy PositionalEncoding
+    - TransformerEncoder
+    - Global average pooling
+    - Warstwa końcowa (regresja)
+    """
+
     def __init__(self, trial):
-        super(CNN2D, self).__init__()
-        num_conv_layers = trial.suggest_int("cnn_num_layers", 1, 6)
-        kernel_size = trial.suggest_int("cnn_kernel_size", 3, 13, step=2)
-        dropout_cnn = trial.suggest_float("cnn_dropout", 0.1, 0.6, step=0.1)
-        batch_norm_on = trial.suggest_categorical("cnn_batch_norm", [True, False])
+        super().__init__()
 
-        conv_layers = []
-        in_channels = 2
-        for i in range(num_conv_layers):
-            out_channels = trial.suggest_int(f"cnn_out_channels_l{i}", 8, 256, log=True)
-            stride = 1
-            padding = 0
+        # ---------------------------
+        # Wymuszamy d_model parzyste i wielokrotność nhead
+        # ---------------------------
+        # 1) losujemy nhead
+        nhead = trial.suggest_int("nhead", 1, 8)
 
-            conv_layers.append(nn.Conv2d(in_channels, out_channels,
-                                         kernel_size=(1, kernel_size),
-                                         stride=stride, padding=(0, padding)))
-            conv_layers.append(nn.SiLU(inplace=True))
-            if batch_norm_on:
-                conv_layers.append(nn.BatchNorm2d(out_channels))
-            conv_layers.append(nn.Dropout2d(p=dropout_cnn))
-            in_channels = out_channels
+        # 2) losujemy d_model z parzystego przedziału [16..256]
+        d_model = trial.suggest_int("d_model", 16, 256, step=2)
 
-        self.conv = nn.Sequential(*conv_layers)
-        linear_out = trial.suggest_int("cnn_linear_out", 16, 256, log=True)
-        self.fc_conv = nn.Linear(in_channels, linear_out)
+        # 3) sprawdzamy, czy d_model % nhead == 0
+        if d_model % nhead != 0:
+            # przerwij tę próbę i przejdź do następnej
+            raise optuna.TrialPruned()
 
-        out_dim = trial.suggest_int("final_hidden_dim", 16, 512, log=True)
-        dropout_final = trial.suggest_float("final_dropout", 0.0, 0.6, step=0.1)
+        # Pozostałe parametry
+        num_layers = trial.suggest_int("num_encoder_layers", 1, 4)
+        dim_ff = trial.suggest_int("dim_feedforward", 32, 1024, log=True)
+        trans_dropout = trial.suggest_float("transformer_dropout", 0.0, 0.5, step=0.1)
 
-        self.final_layers = nn.Sequential(
-            nn.Linear(linear_out, out_dim),
-            nn.SiLU(inplace=True),
-            nn.Dropout(p=dropout_final),
-            nn.Linear(out_dim, 1)
+        # Embedding 1 -> d_model
+        self.embedding = nn.Linear(1, d_model)
+
+        # Positional Encoding
+        self.pos_encoding = PositionalEncoding(d_model)
+
+        # Encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_ff,
+            dropout=trans_dropout,
+            activation="gelu",
+            batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # Warstwa końcowa
+        final_hidden_dim = trial.suggest_int("final_hidden_dim", 16, 512, log=True)
+        final_dropout = trial.suggest_float("final_dropout", 0.0, 0.5, step=0.1)
+
+        self.regressor = nn.Sequential(
+            nn.Linear(d_model, final_hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(p=final_dropout),
+            nn.Linear(final_hidden_dim, 1)
         )
 
     def forward(self, x):
-        # x: (B, 2, 1, 200)
-        x = self.conv(x)          # (B, out_channels, 1, W')
-        x = torch.mean(x, dim=3)  # global avg pooling -> (B, out_channels, 1)
-        x = x.squeeze(2)          # -> (B, out_channels)
-        x = self.fc_conv(x)       # -> (B, linear_out)
-        out = self.final_layers(x)
+        # x: (B, 1, 1, 200)
+        B = x.size(0)
+
+        # 1) usuwamy "kanał" i "wysokość=1", by uzyskać (B,1,200)
+        x = x.view(B, 1, 200)
+
+        # zamieniamy na (B,200,1)
+        x = x.transpose(1, 2)  # => (B, 200, 1)
+
+        # 2) embedding (B,200,1) -> (B,200,d_model)
+        x = self.embedding(x)
+
+        # 3) dodajemy positional encoding
+        x = self.pos_encoding(x)  # (B,200,d_model)
+
+        # 4) transformer encoder => (B,200,d_model)
+        x = self.transformer_encoder(x)
+
+        # 5) global average pooling => (B,d_model)
+        x = x.mean(dim=1)
+
+        # 6) regressor => (B,1)
+        out = self.regressor(x)
         return out.squeeze(1)
 
+
 # =================================================================================
-# Pomocnicze funkcje
+# Pozostałe funkcje jak train, validate, cross_validate, objective, itp.
 # =================================================================================
 def set_seed(seed=1988):
     np.random.seed(seed)
@@ -177,7 +252,7 @@ def validate(model, loader, loss_fn, device):
     return val_loss / len(loader.dataset), rmse, y_true, y_pred
 
 def create_model_and_optimizer(trial):
-    model = CNN2D(trial)
+    model = TransformerRegressorSingle(trial)
     optimizer_name = trial.suggest_categorical("optimizer", ["Adam", "SGD", "RMSProp"])
     lr = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
 
@@ -189,9 +264,6 @@ def create_model_and_optimizer(trial):
         optimizer = optim.RMSprop(model.parameters(), lr=lr)
     return model, optimizer
 
-# =================================================================================
-# 10CV
-# =================================================================================
 def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epochs=50):
     kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
     indices = np.arange(len(dataset))
@@ -233,6 +305,7 @@ def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epoch
             if patience_counter >= max_patience:
                 break
 
+        # Po zakończeniu epok jeszcze raz metryki
         _, val_rmse, y_true_fold, y_pred_fold = validate(model, val_loader, loss_fn, device)
 
         y_true_all.append(y_true_fold)
@@ -263,9 +336,6 @@ def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epoch
     }
     return results
 
-# =================================================================================
-# Objective (3CV) - CNNOnly
-# =================================================================================
 def objective(trial, dataset, device):
     batch_size = trial.suggest_int("batch_size", 16, 256, log=True)
     max_epochs = 50
@@ -310,14 +380,10 @@ def objective(trial, dataset, device):
         raise optuna.TrialPruned()
     return avg_rmse
 
-# =================================================================================
-# main()
-# =================================================================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--path_1h", required=True)
-    parser.add_argument("--path_13c", required=True)
-    parser.add_argument("--experiment_name", default="CNNOnly_Experiment")
+    parser.add_argument("--path_1h", required=True, help="CSV z danymi 1H do predykcji")
+    parser.add_argument("--experiment_name", default="TransformerNMR_Single_1H")
     parser.add_argument("--n_trials", default=20, type=int)
     parser.add_argument("--epochs_10cv", default=50, type=int)
     args = parser.parse_args()
@@ -325,16 +391,13 @@ def main():
     set_seed(1988)
     device = get_device()
 
-    # ------------------------------------------------------------------------------
     # Katalog wyników i logger
-    # ------------------------------------------------------------------------------
     filename_1h = os.path.basename(args.path_1h)
     prefix = filename_1h.split("_")[0]
-    res_dir = prefix + "-results-cnnonly"
+    res_dir = prefix + "-results-transformer-single"
     os.makedirs(res_dir, exist_ok=True)
 
-    # Logger do pliku + stdout
-    log_file = os.path.join(res_dir, "script_cnnonly.log")
+    log_file = os.path.join(res_dir, "script_transformer_single.log")
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -344,12 +407,14 @@ def main():
         ]
     )
     logger = logging.getLogger(__name__)
-    logger.info("Start skryptu (CNNOnly). Katalog wynikowy: %s", res_dir)
+    logger.info("Start skryptu (Transformer 1D, single channel). Katalog wynikowy: %s", res_dir)
 
     try:
         logger.info("Uruchomienie na urządzeniu: %s", device)
-        X_nmr, y = load_nmr_data(args.path_1h, args.path_13c)
-        X_nmr_t = torch.from_numpy(X_nmr).float().unsqueeze(2)
+
+        # Wczytujemy TYLKO 1H
+        X_nmr, y = load_nmr_data_single(args.path_1h)
+        X_nmr_t = torch.from_numpy(X_nmr).float()  # (N,1,1,200)
         y_t = torch.from_numpy(y).float()
         dataset = NMRDataset(X_nmr_t, y_t)
 
@@ -362,9 +427,9 @@ def main():
         best_value = study.best_value
         logger.info("Optuna zakończona. Najlepsze parametry: %s, RMSE=%f", best_params, best_value)
 
-        with mlflow.start_run(run_name="CNNOnly_10CV") as run:
+        with mlflow.start_run(run_name="Transformer_10CV_Single") as run:
             run_tags = dict(MLFLOW_TAGS)
-            run_tags["file"] = prefix 
+            run_tags["file"] = prefix
             mlflow.set_tags(run_tags)
             mlflow.log_params(best_params)
             mlflow.log_param("n_trials", args.n_trials)
@@ -372,17 +437,17 @@ def main():
 
             # (1) Historia triali
             df_trials = study.trials_dataframe(attrs=("number", "value", "params", "state"))
-            csv_optuna = os.path.join(res_dir, "optuna_trials_cnnonly.csv")
+            csv_optuna = os.path.join(res_dir, "optuna_trials_transformer_single.csv")
             df_trials.to_csv(csv_optuna, index=False)
             mlflow.log_artifact(csv_optuna)
 
-            # Wykres RMSE vs. Trial ID
-            plot_trials_path = os.path.join(res_dir, "optuna_trials_rmse_cnnonly.png")
+            # Wykres RMSE vs Trial ID
+            plot_trials_path = os.path.join(res_dir, "optuna_trials_rmse_transformer_single.png")
             fig = plt.figure()
             plt.plot(df_trials["number"], df_trials["value"], marker="o", linestyle="-")
             plt.xlabel("Trial ID")
             plt.ylabel("RMSE (3CV)")
-            plt.title("Optuna: RMSE vs Trial ID (CNNOnly)")
+            plt.title("Optuna: RMSE vs Trial ID (Transformer single)")
             plt.grid(True)
             plt.savefig(plot_trials_path, dpi=300, bbox_inches="tight")
             mlflow.log_artifact(plot_trials_path)
@@ -390,20 +455,19 @@ def main():
 
             # (2) Ważność hiperparametrów
             param_importances = get_param_importances(study)
-            json_path = os.path.join(res_dir, "param_importances_cnnonly.json")
+            json_path = os.path.join(res_dir, "param_importances_transformer_single.json")
             with open(json_path, "w") as f:
                 json.dump(param_importances, f, indent=2)
             mlflow.log_artifact(json_path)
 
-            # Poprawka: tutaj 'fig_imp' to Axes, więc pobieramy figure:
             fig_imp = optuna_viz.plot_param_importances(study)
             fig_real = fig_imp.figure
-            fig_imp_path = os.path.join(res_dir, "param_importances.png")
+            fig_imp_path = os.path.join(res_dir, "param_importances_transformer_single.png")
             fig_real.savefig(fig_imp_path, dpi=300, bbox_inches="tight")
             mlflow.log_artifact(fig_imp_path)
             plt.close(fig_real)
 
-            # (3) 10CV
+            # (3) 10CV z najlepszymi parametrami
             def best_model_func():
                 class FrozenTrialStub:
                     def suggest_int(self, name, low, high, step=None, log=False):
@@ -414,7 +478,7 @@ def main():
                         return best_params[name]
 
                 trial_stub = FrozenTrialStub()
-                model = CNN2D(trial_stub)
+                model = TransformerRegressorSingle(trial_stub)
                 optimizer_name = best_params["optimizer"]
                 lr = best_params["lr"]
                 if optimizer_name == "Adam":
@@ -449,7 +513,6 @@ def main():
             logger.info("10CV zakończone. RMSE=%.4f±%.4f, MAE=%.4f±%.4f",
                         rmse_mean, rmse_std, mae_mean, mae_std)
 
-            # <-- TU DODAŁEMY LOGOWANIE PARAMETRÓW DO MLflow
             mlflow.log_metric("rmse_mean_10cv", rmse_mean)
             mlflow.log_metric("rmse_std_10cv", rmse_std)
             mlflow.log_metric("mae_mean_10cv", mae_mean)
@@ -460,7 +523,7 @@ def main():
             mlflow.log_metric("pearson_std_10cv", pearson_std)
 
             # Zapis metrics
-            metrics_path = os.path.join(res_dir, "metrics_cnnonly.csv")
+            metrics_path = os.path.join(res_dir, "metrics_transformer_single.csv")
             with open(metrics_path, "w") as f:
                 f.write("metric,mean,std\n")
                 f.write(f"rmse,{rmse_mean},{rmse_std}\n")
@@ -470,7 +533,7 @@ def main():
             mlflow.log_artifact(metrics_path)
 
             # hyperparams
-            hyperparams_path = os.path.join(res_dir, "hyperparams_cnnonly.csv")
+            hyperparams_path = os.path.join(res_dir, "hyperparams_transformer_single.csv")
             with open(hyperparams_path, "w") as f:
                 f.write("param,value\n")
                 for k, v in best_params.items():
@@ -484,29 +547,29 @@ def main():
                 "y_true": y_true_all,
                 "y_pred": y_pred_all
             })
-            cv_csv_path = os.path.join(res_dir, "cv_predictions_cnnonly.csv")
+            cv_csv_path = os.path.join(res_dir, "cv_predictions_transformer_single.csv")
             df_cv.to_csv(cv_csv_path, index=False)
             mlflow.log_artifact(cv_csv_path)
 
             # Wykres y_true vs y_pred
-            plot_path = os.path.join(res_dir, "real_vs_pred_plot_cnnonly.png")
+            plot_path = os.path.join(res_dir, "real_vs_pred_plot_transformer_single.png")
             plt.figure(figsize=(6,6))
             plt.scatter(y_true_all, y_pred_all, alpha=0.5)
             plt.xlabel("Rzeczywiste y")
             plt.ylabel("Przewidywane y")
-            plt.title("CNNOnly: Real vs. Pred (10CV)")
+            plt.title("Transformer (Single 1H + PE): Real vs. Pred (10CV)")
             plt.savefig(plot_path, dpi=300, bbox_inches="tight")
             mlflow.log_artifact(plot_path)
             plt.close()
 
-            # Wykres błędu: X=y_true, Y=|y_true - y_pred|
-            error_plot = os.path.join(res_dir, "error_plot_cnnonly.png")
+            # Wykres błędu
+            error_plot = os.path.join(res_dir, "error_plot_transformer_single.png")
             plt.figure(figsize=(6,6))
             abs_error = np.abs(y_true_all - y_pred_all)
             plt.scatter(y_true_all, abs_error, alpha=0.5)
             plt.xlabel("Rzeczywiste y")
             plt.ylabel("|y_true - y_pred|")
-            plt.title("Błąd bezwzględny vs. y_true (10CV) - CNNOnly")
+            plt.title("Błąd bezwzględny vs. y_true (10CV) - Transformer Single")
             plt.savefig(error_plot, dpi=300, bbox_inches="tight")
             mlflow.log_artifact(error_plot)
             plt.close()
@@ -531,15 +594,14 @@ def main():
                 if patience_counter >= max_patience:
                     break
 
-            mlflow.pytorch.log_model(final_model, artifact_path="model_cnnonly")
+            mlflow.pytorch.log_model(final_model, artifact_path="model_transformer_single")
 
             mlflow.end_run()
 
-        logger.info("Skrypt (CNNOnly) zakończył się sukcesem.")
+        logger.info("Skrypt (Transformer 1D, single channel) zakończył się sukcesem.")
 
     except Exception as e:
-        logger = logging.getLogger(__name__)
-        logger.exception("Błąd w trakcie działania skryptu (CNNOnly).")
+        logger.exception("Błąd w trakcie działania skryptu (Transformer 1D single).")
         sys.exit(1)
 
 

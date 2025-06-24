@@ -536,6 +536,15 @@ def evaluate_model_with_cv(csv_path, trial, csv_name):
         mlflow.log_artifact(pred_vs_actual_fig_file)
         plt.close()
 
+        # Zapisanie wartości all_true i all_preds do pliku CSV
+        preds_df = pd.DataFrame({'True_Values': all_true, 'Predicted_Values': all_preds})
+        preds_file_name = f"{csv_name}_predictions.csv"
+        preds_df.to_csv(preds_file_name, index=False)
+
+        # Logowanie pliku z predykcjami jako artefakt do MLflow
+        mlflow.log_artifact(preds_file_name)
+
+
     except Exception as e:
         print(f"Wystąpił błąd podczas oceny modelu z walidacją krzyżową: {e}")
         raise e

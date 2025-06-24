@@ -99,39 +99,46 @@ def load_nmr_data(path_1h, path_13c):
 # Model CNN - alternatywny kształt danych
 # =================================================================================
 class CNN2DAlt(nn.Module):
-    """
-    W tej wersji in_channels=1, a kernel_size=(2, kernel_size_w),
-    aby filtr zawsze obejmował obie "linie" (¹H i ¹³C) w pionie.
-    """
     def __init__(self, trial):
         super(CNN2DAlt, self).__init__()
 
-        # Liczba splotów w sekwencji
         num_conv_layers = trial.suggest_int("cnn_num_layers", 1, 6)
-
-        # Kernel w poziomie (w pionie ustalamy na 2, bo mamy 2 "wiersze")
         kernel_size_w = trial.suggest_int("cnn_kernel_size", 3, 13, step=2)
-
         dropout_cnn = trial.suggest_float("cnn_dropout", 0.1, 0.6, step=0.1)
         batch_norm_on = trial.suggest_categorical("cnn_batch_norm", [True, False])
 
         conv_layers = []
-        # in_channels = 1, bo teraz jest jeden "kanał"
         in_channels = 1
 
-        for i in range(num_conv_layers):
-            out_channels = trial.suggest_int(f"cnn_out_channels_l{i}", 8, 256, log=True)
-            stride = 1
-            padding = 0
+        # --- Pierwsza warstwa: kernel=(2, kernel_size_w)
+        out_channels = trial.suggest_int(f"cnn_out_channels_l0", 8, 256, log=True)
+        conv_layers.append(
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=(2, kernel_size_w),
+                stride=1,
+                padding=0
+            )
+        )
+        conv_layers.append(nn.SiLU(inplace=True))
+        if batch_norm_on:
+            conv_layers.append(nn.BatchNorm2d(out_channels))
+        conv_layers.append(nn.Dropout2d(p=dropout_cnn))
 
-            # kernel_size=(2, kernel_size_w)
+        in_channels = out_channels
+
+        # --- Pozostałe warstwy: kernel=(1, kernel_size_w)
+        for i in range(1, num_conv_layers):
+            out_channels = trial.suggest_int(f"cnn_out_channels_l{i}", 8, 256, log=True)
+
             conv_layers.append(
                 nn.Conv2d(
-                    in_channels, 
+                    in_channels,
                     out_channels,
-                    kernel_size=(2, kernel_size_w),
-                    stride=stride, 
-                    padding=(0, padding)
+                    kernel_size=(1, kernel_size_w),
+                    stride=1,
+                    padding=0
                 )
             )
             conv_layers.append(nn.SiLU(inplace=True))
@@ -143,14 +150,12 @@ class CNN2DAlt(nn.Module):
 
         self.conv = nn.Sequential(*conv_layers)
 
-        # warstwa liniowa po global avg pooling
+        # linear po global poolu
         linear_out = trial.suggest_int("cnn_linear_out", 16, 256, log=True)
         self.fc_conv = nn.Linear(in_channels, linear_out)
 
-        # warstwa finalna
         out_dim = trial.suggest_int("final_hidden_dim", 16, 512, log=True)
         dropout_final = trial.suggest_float("final_dropout", 0.0, 0.6, step=0.1)
-
         self.final_layers = nn.Sequential(
             nn.Linear(linear_out, out_dim),
             nn.SiLU(inplace=True),
@@ -159,21 +164,17 @@ class CNN2DAlt(nn.Module):
         )
 
     def forward(self, x):
-        # x kształt: (B, 1, 2, 200)
-        x = self.conv(x)          
-        # Po splotach: (B, out_channels, H', W') 
-        # a że H'= (2 - 2 + 1)=1 => H'=1 (bez paddingu), W' zależy od kernel_size_w
+        # x: (B, 1, 2, W)
+        x = self.conv(x)
+        # Po pierwszej warstwie będzie (B, out_channels, 1, W') => po każdej kolejnej też (B, out_channels, 1, W'')
 
-        # Global Average Pooling - uśredniamy po szerokości
-        x = torch.mean(x, dim=3)  # (B, out_channels, H'=1)
+        # Global average pooling w wymiarze szerokości
+        x = torch.mean(x, dim=3)  # => (B, out_channels, 1)
 
-        # Ściśnij wymiar wysokości (1)
-        x = x.squeeze(2)          # => (B, out_channels)
-
-        x = self.fc_conv(x)       # => (B, linear_out)
+        x = x.squeeze(2)  # => (B, out_channels)
+        x = self.fc_conv(x)  # => (B, linear_out)
         out = self.final_layers(x)
         return out.squeeze(1)
-
 
 # =================================================================================
 # Pomocnicze funkcje
@@ -499,14 +500,15 @@ def main():
             logger.info("10CV zakończone. RMSE=%.4f±%.4f, MAE=%.4f±%.4f",
                         rmse_mean, rmse_std, mae_mean, mae_std)
 
-            mlflow.log_param("rmse_mean_10cv", rmse_mean)
-            mlflow.log_param("rmse_std_10cv", rmse_std)
-            mlflow.log_param("mae_mean_10cv", mae_mean)
-            mlflow.log_param("mae_std_10cv", mae_std)
-            mlflow.log_param("r2_mean_10cv", r2_mean)
-            mlflow.log_param("r2_std_10cv", r2_std)
-            mlflow.log_param("pearson_mean_10cv", pearson_mean)
-            mlflow.log_param("pearson_std_10cv", pearson_std)
+            # <-- TU DODAŁEMY LOGOWANIE PARAMETRÓW DO MLflow
+            mlflow.log_metric("rmse_mean_10cv", rmse_mean)
+            mlflow.log_metric("rmse_std_10cv", rmse_std)
+            mlflow.log_metric("mae_mean_10cv", mae_mean)
+            mlflow.log_metric("mae_std_10cv", mae_std)
+            mlflow.log_metric("r2_mean_10cv", r2_mean)
+            mlflow.log_metric("r2_std_10cv", r2_std)
+            mlflow.log_metric("pearson_mean_10cv", pearson_mean)
+            mlflow.log_metric("pearson_std_10cv", pearson_std)
 
             # Zapis metrics
             metrics_path = os.path.join(res_dir, "metrics_cnnonly_alt.csv")

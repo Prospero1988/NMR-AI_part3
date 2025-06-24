@@ -2,7 +2,7 @@
 # Skrypt uruchamiający eksperymenty dla modeli hybrydowego (CNN+MLP) oraz CNN-only.
 # W razie błędu skrypt zatrzyma się (set -e).
 
-set -e
+# set -e
 
 echo "Rozpoczynam eksperymenty dla modelu hybrydowego (CNN+MLP)..."
 
