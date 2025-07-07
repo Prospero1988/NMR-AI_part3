@@ -1,0 +1,29 @@
+Best parameters:
+batch_size: 74
+epochs: 300
+early_stop_patience: 17
+use_scheduler: False
+clip_grad_value: 1.7000000000000002
+activation: leaky_relu
+regularization: none
+dropout_rate: 0.011296157529268689
+use_batch_norm: False
+num_conv_layers: 1
+num_filters_l0: 44
+kernel_size_l0: 5
+stride_l0: 2
+padding_l0: 1
+num_fc_layers: 2
+fc_units_l0: 291
+fc_units_l1: 194
+weight_init: normal
+optimizer: adam
+learning_rate: 4.987311937359978e-05
+adam_beta1: 0.969522028389257
+adam_beta2: 0.9675737104607145
+
+10CV Metrics:
+10CV RMSE: 0.5657539963722229
+10CV MAE: 0.3938623070716858
+10CV R2: 0.7667959928512573
+10CV Pearson Correlation: 0.8782945836690146

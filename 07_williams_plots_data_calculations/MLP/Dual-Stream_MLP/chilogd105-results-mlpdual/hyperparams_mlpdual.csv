@@ -1,0 +1,11 @@
+param,value
+batch_size,18
+mlp_num_layers,1
+mlp_dropout,0.4
+h_hidden_dim_l0,41
+c_hidden_dim_l0,941
+embed_dim,30
+final_hidden_dim,58
+final_dropout,0.2
+optimizer,Adam
+lr,0.0009118140473534383

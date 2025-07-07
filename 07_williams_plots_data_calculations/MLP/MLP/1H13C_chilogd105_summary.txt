@@ -1,0 +1,24 @@
+Best parameters:
+batch_size: 17
+epochs: 50
+early_stop_patience: 19
+activation: leaky_relu
+regularization: l1
+reg_rate: 0.0014560204867617732
+num_layers: 1
+units: 62
+dropout_rate: 0.3300001875440933
+use_batch_norm: False
+weight_init: normal
+optimizer: adam
+learning_rate: 0.0009250652731303243
+adam_beta1: 0.8389551671584782
+adam_beta2: 0.9684899595926573
+use_scheduler: True
+clip_grad_value: 0.30000000000000004
+
+10CV Metrics:
+10CV RMSE: 0.7814233303070068
+10CV MAE: 0.5832286477088928
+10CV R2: 0.508029305934906
+10CV Pearson Correlation: 0.7212284662266939
