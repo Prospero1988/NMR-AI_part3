@@ -1,23 +1,20 @@
-# module2.py
 import setuptools  # Ensure setuptools is imported first
-import time
-import os
-import sys
-import argparse
-import logging
-import pandas as pd
-import numpy as np
-import joblib
-import mlflow
-import json
-import subprocess
-from logging.handlers import RotatingFileHandler
-from sklearn.svm import SVR
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from scipy.stats import pearsonr
-from mlflow.models.signature import infer_signature
 import warnings
-import tags_config
+import os
+import pandas as pd
+import xgboost as xgb
+import numpy as np
+import sys
+import logging
+from logging.handlers import RotatingFileHandler
+import mlflow
+import mlflow.xgboost
+import argparse
+import time
+import json
+import joblib
+from mlflow.models.signature import infer_signature
+import XGB_tags_config
 import matplotlib.pyplot as plt  # Import matplotlib for plotting
 from sklearn.model_selection import KFold  # Import KFold for cross-validation
 
@@ -26,44 +23,6 @@ warnings.filterwarnings("ignore", message=".*integer column.*", category=UserWar
 
 # Suppress the setuptools/distutils warning
 warnings.filterwarnings("ignore", message="Setuptools is replacing distutils")
-
-# Initialize basic logging
-logging.basicConfig(level=logging.INFO)
-
-def main():
-    """
-    Main function for SVR model training with MLflow and 10-fold cross-validation.
-    Parses command-line arguments, sets up MLflow experiment, and processes each CSV file.
-    """
-    parser = argparse.ArgumentParser(
-        description='SVR Model Training with MLflow and 10-fold Cross-Validation'
-    )
-    parser.add_argument(
-        'input_directory',
-        type=str,
-        help='Path to the input directory containing CSV files'
-    )
-    parser.add_argument(
-        '--experiment_name',
-        type=str,
-        default='Default',
-        help='Name of the MLflow experiment'
-    )
-    args = parser.parse_args()
-
-    input_directory = args.input_directory
-    experiment_name = args.experiment_name
-
-    # Set the MLflow experiment
-    mlflow.set_experiment(experiment_name)
-
-    csv_files = check_input_directory(input_directory)
-
-    for csv_file in csv_files:
-        process_file(csv_file, input_directory)
-        # Ensure that each run is properly ended
-        if mlflow.active_run():
-            mlflow.end_run()
 
 def setup_logging(logger_name, log_file):
     """
@@ -83,19 +42,13 @@ def setup_logging(logger_name, log_file):
     if logger.hasHandlers():
         logger.handlers.clear()
 
-    # Log formatting
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-
-    # File handler
     file_handler = RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=2)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
-
-    # Console handler
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
-
     logger.info("Logging initialized.")
     return logger
 
@@ -115,13 +68,10 @@ def check_input_directory(input_directory):
     if not os.path.exists(input_directory):
         logging.error(f"Directory {input_directory} does not exist.")
         sys.exit(1)
-
     csv_files = sorted([f for f in os.listdir(input_directory) if f.endswith('.csv')])
-
     if not csv_files:
         logging.error("No CSV files found in the input directory.")
         sys.exit(1)
-
     logging.info(f"Found {len(csv_files)} CSV file(s) in the directory.")
     return csv_files
 
@@ -133,44 +83,51 @@ def load_data(file_path):
         file_path (str): Path to the CSV file.
 
     Returns:
-        pd.DataFrame: Data as a pandas DataFrame.
+        np.ndarray: Data as a NumPy array.
     """
     data = pd.read_csv(file_path)
-    # Drop the non-numeric column (if any), e.g., MOLECULE_NAME
-    data = data.iloc[:, 1:]
-    return data  # Return as pandas DataFrame
+    data = data.iloc[:, 1:]  # Exclude MOLECULE_NAME if present
+    return data.values  # Return as NumPy array
 
-def train_final_model(X, y, best_params):
+def train_final_model(X, y, best_params, num_boost_round):
     """
-    Train an SVR model on the provided data.
+    Train an XGBoost model on the provided data.
 
     Args:
         X (np.ndarray): Feature matrix.
         y (np.ndarray): Target vector.
-        best_params (dict): Hyperparameters for SVR.
+        best_params (dict): Hyperparameters for XGBoost.
+        num_boost_round (int): Number of boosting rounds.
 
     Returns:
-        SVR: Trained SVR model.
+        tuple: (trained model, evals_result dictionary)
     """
-    model = SVR(**best_params)
-    model.fit(X, y)
-    return model
+    dtrain = xgb.DMatrix(X, label=y)
+    evals_result = {}
+    model = xgb.train(
+        best_params,
+        dtrain,
+        num_boost_round=num_boost_round,
+        evals=[(dtrain, 'train')],
+        evals_result=evals_result,
+        verbose_eval=False
+    )
+    return model, evals_result
 
 def evaluate_model(model, X, y):
     """
     Evaluate the model and compute metrics.
 
     Args:
-        model (SVR): Trained SVR model.
+        model (Booster): Trained XGBoost model.
         X (np.ndarray): Feature matrix.
         y (np.ndarray): Target vector.
 
     Returns:
-        tuple: (metrics dict, per-instance DataFrame)
+        tuple: (metrics dict, per-instance DataFrame, predictions)
     """
-    y_pred = model.predict(X)
-
-    # Compute metrics using NumPy
+    dtest = xgb.DMatrix(X)
+    y_pred = model.predict(dtest)
     abs_error = np.abs(y - y_pred)
     per_instance_data = pd.DataFrame({
         'Actual': y,
@@ -178,17 +135,18 @@ def evaluate_model(model, X, y):
         'Absolute Error': abs_error
     })
 
-    # Overall metrics
-    rmse = mean_squared_error(y, y_pred, squared=False)
-    mae = mean_absolute_error(y, y_pred)
+    rmse = np.sqrt(np.mean((y - y_pred) ** 2))
+    mae = np.mean(abs_error)
     mae_std = np.std(abs_error)
-    r2 = r2_score(y, y_pred)
 
-    # Pearson correlation coefficient
+    ss_tot = np.sum((y - np.mean(y)) ** 2)
+    ss_res = np.sum((y - y_pred) ** 2)
+    r2 = 1 - ss_res / ss_tot
+
     if y.size > 1:
-        pearson_corr, _ = pearsonr(y, y_pred)
+        pearson_corr = np.corrcoef(y, y_pred)[0, 1]
     else:
-        pearson_corr = float('nan')  # Not defined for single sample
+        pearson_corr = float('nan')
 
     metrics = {
         'RMSE': rmse,
@@ -198,19 +156,7 @@ def evaluate_model(model, X, y):
         'Pearson': pearson_corr,
     }
 
-    return metrics, per_instance_data
-
-def save_model(model, file_name, logger):
-    """
-    Save the trained model to a file.
-
-    Args:
-        model (SVR): Trained SVR model.
-        file_name (str): Path to save the model.
-        logger (logging.Logger): Logger instance.
-    """
-    joblib.dump(model, file_name)
-    logger.info(f"Model saved to {file_name}")
+    return metrics, per_instance_data, y_pred
 
 def save_metrics_and_params(avg_metrics, params, file_name, logger, fold_metrics_list=None, final_metrics=None):
     """
@@ -253,41 +199,29 @@ def process_file(csv_file, input_directory):
         input_directory (str): Path to the input directory.
     """
     try:
+        logger = setup_logging('Training', f'training_{csv_file}.log')
         data = load_data(os.path.join(input_directory, csv_file))
+        y = data[:, 0]
+        X = data[:, 1:]
 
-        # Ensure data is a pandas DataFrame with proper columns
-        # Assuming the target variable is in the first column after MOLECULE_NAME
-        y = data.iloc[:, 0].values
-        X = data.iloc[:, 1:].values
-
-        # Load best hyperparameters from JSON file
-        best_params_file = f"best_hyperparameters_{os.path.splitext(csv_file)[0]}.json"
-        if not os.path.exists(best_params_file):
-            logging.error(f"Best hyperparameters file not found: {best_params_file}")
-            return
-
+        # Read best hyperparameters
+        best_params_file = f"best_params_{os.path.splitext(csv_file)[0]}.json"
         with open(best_params_file, 'r') as f:
             best_params = json.load(f)
 
-        # Adjust hyperparameters for scikit-learn's SVR
-        best_params = adjust_hyperparameters(best_params)
+        num_boost_round = best_params.pop('num_boost_round', 100)
+        # Adjust parameters for CPU training
+        best_params.pop('device', None)
+        best_params.pop('gpu_id', None)
+        best_params['tree_method'] = 'hist'  # Use CPU hist method
 
-        # Start MLflow run
-        with mlflow.start_run(run_name=f"Training_{csv_file}_{int(time.time())}"):
+        run_name = f"Training_{csv_file}_{int(time.time())}"
+        with mlflow.start_run(run_name=run_name):
+            
             # Set tags from the external file
-            for tag_name, tag_value in tags_config.mlflow_tags2.items():
+            for tag_name, tag_value in XGB_tags_config.mlflow_tags2.items():
                 mlflow.set_tag(tag_name, tag_value)
-
-            # Log environment
-            log_environment()
-
-            # Initialize logger
-            logger = setup_logging('Training', f'training_{csv_file}.log')
-            logger.info(f"Starting training for {csv_file}")
-
-            # Log best hyperparameters
-            mlflow.log_params(best_params)
-
+    
             # Set up KFold cross-validation
             kf = KFold(n_splits=10, shuffle=True, random_state=42)
             fold_metrics_list = []
@@ -300,13 +234,13 @@ def process_file(csv_file, input_directory):
                 y_train, y_val = y[train_index], y[val_index]
 
                 # Train the model on the training set
-                model = train_final_model(X_train, y_train, best_params)
+                model, evals_result = train_final_model(X_train, y_train, best_params, num_boost_round)
 
                 # Evaluate the model on the validation set
-                metrics, per_instance_data = evaluate_model(model, X_val, y_val)
+                metrics, per_instance_data, y_pred = evaluate_model(model, X_val, y_val)
 
                 # Update the overall predictions
-                y_pred_all[val_index] = model.predict(X_val)
+                y_pred_all[val_index] = y_pred
 
                 # Append per-instance data
                 per_instance_data_list.append(per_instance_data)
@@ -338,13 +272,12 @@ def process_file(csv_file, input_directory):
             mlflow.log_artifact(per_instance_data_file)
 
             # Train final model on the full dataset
-            final_model = train_final_model(X, y, best_params)
+            final_model, evals_result = train_final_model(X, y, best_params, num_boost_round)
 
             # Evaluate final model
-            final_metrics, final_per_instance_data = evaluate_model(final_model, X, y)
+            final_metrics, final_per_instance_data, y_pred_final = evaluate_model(final_model, X, y)
 
             # Generate and log plots for final model predictions
-            y_pred_final = final_model.predict(X)
             generate_and_log_plots(y, y_pred_final, csv_file, suffix='_final')
 
             # Log final model metrics
@@ -352,26 +285,20 @@ def process_file(csv_file, input_directory):
 
             # Save the final model trained on the full data
             model_file_name = f"{os.path.splitext(csv_file)[0]}_trained_model.pkl"
-            save_model(final_model, model_file_name, logger)
+            joblib.dump(final_model, model_file_name)
             mlflow.log_artifact(model_file_name)
 
-            # Log the model to MLflow in standard format with signature and input example
+            # Save the model to MLflow
             input_example = pd.DataFrame(X[:5])
-            signature = infer_signature(input_example, final_model.predict(X[:5]))
-
-            # Convert integer columns to float64 to handle potential missing values in the future
-            X_df = pd.DataFrame(X)
-            X_df = X_df.astype({col: 'float64' for col in X_df.select_dtypes('int').columns})
-
-            # Now log the model with the updated data types
-            mlflow.sklearn.log_model(
-                sk_model=final_model,
+            signature = infer_signature(input_example, y_pred_final[:5])
+            mlflow.xgboost.log_model(
+                final_model,
                 artifact_path="model",
                 signature=signature,
                 input_example=input_example
             )
 
-            # Save metrics and parameters
+            # Save metrics and parameters to file
             metrics_file_name = f"{os.path.splitext(csv_file)[0]}_trained_metrics_and_params.txt"
             save_metrics_and_params(avg_metrics, best_params, metrics_file_name, logger, fold_metrics_list, final_metrics)
             mlflow.log_artifact(metrics_file_name)
@@ -388,65 +315,29 @@ def process_file(csv_file, input_directory):
                 f"MAE: {final_metrics['MAE']:.4f}, MAE StDev: {final_metrics['MAE StDev']:.4f}"
             )
 
-            logger.info(f"Finished training for {csv_file}")
+        logger.info(f"Finished processing {csv_file}")
 
     except Exception as e:
         logging.error(f"Error processing {csv_file}: {e}", exc_info=True)
-        # End any active runs before logging exception
-        if mlflow.active_run():
-            mlflow.end_run()
-        # Use a unique key for the exception to avoid conflicts
-        with mlflow.start_run(run_name=f"Error_{csv_file}_{int(time.time())}", nested=True):
-            mlflow.log_param(f'Exception_{csv_file}', str(e))
+        mlflow.log_param('Exception', str(e))
 
-def adjust_hyperparameters(best_params):
+def main():
     """
-    Adjust hyperparameters to be compatible with scikit-learn's SVR.
-
-    Args:
-        best_params (dict): Hyperparameters from optimization.
-
-    Returns:
-        dict: Adjusted hyperparameters.
+    Main function for training with XGBoost and 10-fold Cross-Validation.
+    Parses command-line arguments, sets up MLflow experiment, and processes each CSV file.
     """
-    # Handle 'gamma_type' and set 'gamma' accordingly
-    gamma_type = best_params.pop('gamma_type', 'scale')  # Default to 'scale' if not present
-    if gamma_type == 'float':
-        # 'gamma' is already set in best_params
-        pass
-    else:
-        # Set 'gamma' to 'scale' or 'auto'
-        best_params['gamma'] = gamma_type
-    # Remove any parameters not supported by scikit-learn's SVR
-    # Check scikit-learn version
-    import sklearn
-    from packaging import version
-    sk_version = sklearn.__version__
-    if version.parse(sk_version) < version.parse('0.24'):
-        # Remove 'max_iter' if scikit-learn version is less than 0.24
-        best_params.pop('max_iter', None)
-    # Else, 'max_iter' is supported and can be kept
+    parser = argparse.ArgumentParser(description='Training with XGBoost and 10-fold Cross-Validation')
+    parser.add_argument('input_directory', type=str, help='Path to the input directory containing CSV files')
+    parser.add_argument('--experiment_name', type=str, default='Default', help='Name of the MLflow experiment')
+    args = parser.parse_args()
 
-    return best_params
+    input_directory = args.input_directory
+    experiment_name = args.experiment_name
+    mlflow.set_experiment(experiment_name)
 
-def log_environment():
-    """
-    Log the current conda environment or pip requirements as an MLflow artifact.
-    """
-    try:
-        # Export conda environment
-        conda_env_file = 'conda_environment.yml'
-        subprocess.call(['conda', 'env', 'export', '--no-builds', '-f', conda_env_file])
-        mlflow.log_artifact(conda_env_file)
-    except Exception as e:
-        logging.warning(f"Could not log conda environment: {e}")
-        # If conda is not available, try logging pip packages
-        try:
-            pip_req_file = 'requirements.txt'
-            subprocess.call('pip freeze > requirements.txt', shell=True)
-            mlflow.log_artifact(pip_req_file)
-        except Exception as e:
-            logging.warning(f"Could not log pip requirements: {e}")
+    csv_files = check_input_directory(input_directory)
+    for csv_file in csv_files:
+        process_file(csv_file, input_directory)
 
 def generate_and_log_plots(y_true, y_pred, csv_file, suffix=''):
     """

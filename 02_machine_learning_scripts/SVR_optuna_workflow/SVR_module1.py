@@ -13,7 +13,7 @@ import subprocess
 from logging.handlers import RotatingFileHandler
 from cuml.svm import SVR
 from sklearn.model_selection import KFold
-import tags_config
+import SVR_tags_config
 import matplotlib.pyplot as plt
 import optuna.visualization.matplotlib as optuna_visualization
 
@@ -271,7 +271,7 @@ def process_file(csv_file, input_directory):
         with mlflow.start_run(run_name=f"Optimization_{csv_file}_{int(time.time())}"):
 
             # Set tags from the external file
-            for tag_name, tag_value in tags_config.mlflow_tags1.items():
+            for tag_name, tag_value in SVR_tags_config.mlflow_tags1.items():
                 mlflow.set_tag(tag_name, tag_value)
 
             # Log environment

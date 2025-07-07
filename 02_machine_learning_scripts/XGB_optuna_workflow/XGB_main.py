@@ -30,10 +30,10 @@ def main():
     experiment_name = args.experiment_name
 
     # Call hyperparameter optimization module
-    subprocess.run(['python', 'module1.py', input_directory, '--experiment_name', experiment_name])
+    subprocess.run(['python', 'XGB_module1.py', input_directory, '--experiment_name', experiment_name])
 
     # Call training module with 10-fold cross-validation evaluation
-    subprocess.run(['python', 'module2.py', input_directory, '--experiment_name', experiment_name])
+    subprocess.run(['python', 'XGB_module2.py', input_directory, '--experiment_name', experiment_name])
 
 
 if __name__ == "__main__":

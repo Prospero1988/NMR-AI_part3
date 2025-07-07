@@ -14,7 +14,7 @@ import argparse
 import subprocess
 import time
 import json
-import tags_config
+import XGB_tags_config
 import matplotlib.pyplot as plt
 import optuna.visualization.matplotlib as optuna_visualization
 
@@ -225,7 +225,7 @@ def process_file(csv_file, input_directory):
         with mlflow.start_run(run_name=run_name):
             
             # Set tags from the external file
-            for tag_name, tag_value in tags_config.mlflow_tags1.items():
+            for tag_name, tag_value in XGB_tags_config.mlflow_tags1.items():
                 mlflow.set_tag(tag_name, tag_value)
             
             log_environment()

@@ -30,10 +30,10 @@ def main():
     experiment_name = args.experiment_name
 
     # Call module1.py for hyperparameter optimization with Optuna
-    subprocess.run(['python', 'module1.py', input_directory, '--experiment_name', experiment_name])
+    subprocess.run(['python', 'SVR_module1.py', input_directory, '--experiment_name', experiment_name])
 
     # Call module2.py for 10-fold cross-validation evaluation
-    subprocess.run(['python', 'module2.py', input_directory, '--experiment_name', experiment_name])
+    subprocess.run(['python', 'SVR_module2.py', input_directory, '--experiment_name', experiment_name])
 
 if __name__ == "__main__":
     # Entry point for the script
