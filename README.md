@@ -32,6 +32,7 @@ NMR-AI_part3/
 ├── 04_hybrid_neural_networks_scripts/
 ├── 05_conda_environments/
 ├── 06_utility_scripts/
+├── 07_williams_plots_data_calculations/
 ```
 
 ---
@@ -156,6 +157,25 @@ python combine_nmr_inputs.py <directory_with_csvs>
 ```
 
 ---
+
+## 07_williams_plots_data_calculations/
+
+This directory contains streamlined scripts dedicated to final model training and the generation of output files required for **Applicability Domain (AD)** analysis using **Williams plots**.
+
+Each script uses pre-optimized hyperparameters (from prior Optuna runs) to train a model and produce:
+
+- predicted vs. true values
+- residuals and standardized residuals
+- leverage values
+- CSV files with full prediction tables and flagged outliers
+
+All scripts are internally documented.  
+Each subfolder contains example input and configuration files needed to reproduce the full set of outputs.
+
+These outputs are suitable for generating Williams plots to assess the reliability and extrapolation limits of trained models.
+
+---
+
 ## Experiment Logging & Optimization
 
 - All scripts support **MLflow** for experiment tracking.
