@@ -1,78 +1,176 @@
+# NMR-AI_part3: Supplementary Data & Scripts for ML-Based logD Prediction
 
-# Machine Learning Hyperparameter Optimization with CUDA and Optuna
+This repository contains the datasets and source code used in the third publication of the *From NMR to AI* series:  
+**[Title Placeholder]**, *[DOI Placeholder]*.
 
-This repository contains two Python scripts designed for optimizing machine learning models using Optuna, MLflow, and CUDA acceleration.
+The work focuses on the prediction of CHI logD values using classical machine learning algorithms and neural network architectures trained on NMR spectral representations (¹H, ¹³C, and hybrid).
 
-## Files
-- `SVR_ML_Optuna_CUDA_v2.py`: This script performs Support Vector Regression (SVR) hyperparameter optimization using Optuna, MLflow for logging, and CUDA for GPU acceleration. It includes data loading, model training, and evaluation routines.
-- `XGB_ML_Optuna_CUDA.py`: This script focuses on XGBoost model optimization using Optuna and MLflow, also leveraging CUDA for accelerated training.
-- `conda_environment.yml`: A YAML file describing the conda environment required to run the scripts, including necessary dependencies.
+All scripts follow the PEP8 standard and are integrated with **MLflow** for experiment tracking, and **Optuna** for hyperparameter optimization.  
+The repository supports Python 3.12.
 
-### Key Features
-- **Hyperparameter Optimization**: Both scripts use Optuna to optimize key model parameters.
-- **CUDA Acceleration**: Training is accelerated using NVIDIA GPUs through CuPy for SVR and XGBoost's GPU-based algorithms.
-- **MLflow Integration**: All experiments are tracked using MLflow, including logging of parameters, metrics, and artifacts.
-- **Cross-Validation**: Both scripts employ cross-validation for evaluating model performance.
-- **Result Logging**: Both models log performance metrics such as RMSE, MAE, and R², along with hyperparameter search spaces and importance.
-- **Feature Importances and Learning Curves**: XGBoost script logs feature importances and learning curves to MLflow.
+---
 
-## Installation
+## ߗ Repository Structure
 
-### Prerequisites
-Ensure you have the following installed:
-- CUDA-enabled GPU
-- Python 3.x
-- The required Python packages listed in `conda_environment.yml`
-
-You can create the conda environment by running:
-```bash
-conda env create -f conda_environment.yml
-conda activate optuna_new
+```
+NMR-AI_part3/
+├── 01_datasets/
+├── 02_machine_learning_scripts/
+│   ├── SVR_optuna_workflow/
+│   └── XGB_optuna_workflow/
+├── 03_neural_networks_scripts/
+├── 04_hybrid_neural_networks_scripts/
+├── 05_conda_environments/
+├── 06_utility_scripts/
 ```
 
-This will install the necessary packages, including:
-- `cupy`, `optuna`, `mlflow`, `pandas`, `joblib`, `scikit-learn`, `matplotlib`, `xgboost`, and `cuml`.
+---
 
-### Environment
-Make sure your environment is set up for CUDA, and that the necessary drivers and libraries are installed (e.g., `nvidia-cuda-toolkit`).
+## 01_datasets/
 
-## Usage
+Contains all CSV input files used for training and testing. Each file follows the schema:
 
-### Running SVR Optimization (`SVR_ML_Optuna_CUDA_v2.py`)
+- `MOLECULE_NAME`  
+- `LABEL` (target CHI logD value)  
+- `FEATURE_001` … `FEATURE_NNN` (spectral or fingerprint features)
+
+Datasets include both newly generated data and updated versions of previously published sets.
+
+---
+
+## 02_machine_learning_scripts/
+
+### ➤ SVR_optuna_workflow/
+
+Classical regression pipeline based on **Support Vector Regression (SVR)**:
+
+- `SVR_main.py` – master script executing the full pipeline (Optuna + evaluation)
+- `SVR_module1.py` – performs Optuna-based hyperparameter tuning
+- `SVR_module2.py` – evaluates the best model using 10-fold cross-validation
+
+Usage:
 ```bash
-python SVR_ML_Optuna_CUDA_v2.py /path/to/your/input_directory --experiment_name 'SVR_Experiment'
+python SVR_main.py <input_directory> --experiment_name <mlflow_experiment_name>
 ```
-This script will search for CSV files in the input directory, load the data, and begin optimizing SVR hyperparameters. The results, including optimized models and metrics, will be logged using MLflow.
 
-### Running XGBoost Optimization (`XGB_ML_Optuna_CUDA.py`)
+### ➤ XGB_optuna_workflow/
+
+Same workflow for **XGBoost regression**:
+
+- `XGB_main.py`, `XGB_module1.py`, `XGB_module2.py` – analogous to SVR
+
+Usage:
 ```bash
-python XGB_ML_Optuna_CUDA.py /path/to/your/input_directory --experiment_name 'XGBoost_Experiment'
+python XGB_main.py <input_directory> --experiment_name <mlflow_experiment_name>
 ```
-Similar to the SVR script, this will load data from CSV files and optimize XGBoost hyperparameters. Results are logged using MLflow.
 
-### Input Files
-The input directory should contain CSV files with the following format:
-- Column 1: Sample identifier
-- Column 2: Target variable (e.g., continuous regression target)
-- Columns 3+: Feature vectors
+---
 
-## Model Evaluation
+## 03_neural_networks_scripts/
 
-Both scripts perform cross-validation and log various evaluation metrics, including:
-- RMSE (Root Mean Squared Error)
-- MAE (Mean Absolute Error)
-- R² (Coefficient of Determination)
-- Pearson correlation coefficient
+Scripts for **1D neural network models** working on either ¹H or ¹³C spectral data:
 
-The XGBoost script additionally logs:
-- Feature importances
-- Learning curves
+- `CNN_1D_pytorch.py` – 1D convolutional network with Optuna tuning and 10CV evaluation
+- `MLP_1D_pytorch.py` – fully connected MLP for 1D spectral input
+- `tags_config_CNN_1D.py`, `tags_config_MLP_1D.py` – MLflow tag dictionaries (user-defined)
 
-## Logging and Artifacts
-MLflow is used to log:
-- Hyperparameter search space and importance
-- Metrics (RMSE, MAE, R², etc.)
-- Model artifacts (e.g., trained models, feature importance plots)
+Usage:
+```bash
+python CNN_1D_pytorch.py --input_csv <file> --experiment_name <mlflow_name>
+python MLP_1D_pytorch.py --input_csv <file> --experiment_name <mlflow_name>
+```
 
-## License
-This project is licensed under the MIT License.
+---
+
+## 04_hybrid_neural_networks_scripts/
+
+Advanced architectures combining **¹H and ¹³C** representations in dual-stream networks:
+
+- `cnn_2d_stacked_1H_13C.py` – 2D CNN on stacked vectors (shape: 1×2×200)
+- `cnn_dualstream_1H_13C.py` – two-stream 1D CNN with optional cross-attention
+- `mlp_dualstream_1H_13C.py` – dual-stream MLP with optional attention between streams
+- `run_all_experiments_hybrid.sh` – bash script to batch-run experiments for all datasets and models
+
+Each script follows the same scheme:  
+**3-fold CV for optimization** → **10-fold CV for evaluation** → **final model training**
+
+Example usage:
+```bash
+python cnn_dualstream_1H_13C.py --path_1h <file> --path_13c <file> --experiment_name CNNHybrid
+```
+
+To run all experiments:
+```bash
+bash run_all_experiments_hybrid.sh
+```
+
+---
+
+## 05_conda_environments/
+
+YAML definitions of Conda environments required to reproduce results:
+
+- `machine_learning_optuna.yml` – for SVR and XGBoost models
+- `neural_networks_optuna.yml` – for all CNN/MLP-based neural networks
+
+Installation (one-time):
+```bash
+conda env create -f machine_learning_optuna.yml
+conda env create -f neural_networks_optuna.yml
+```
+
+Each script is annotated with required packages and compatible Python version (3.12).
+
+---
+
+## 06_utility_scripts/
+
+### ➤ `combine_nmr_inputs.py`
+
+Creates merged spectral representations from pairs of ¹H and ¹³C files in three variants:
+
+1. **Concatenation (1H13C)** – ¹H followed by ¹³C  
+2. **Concatenation (13C1H)** – ¹³C followed by ¹H  
+3. **Element-wise sum (1Hx13C)** – summing corresponding features
+
+Output is saved to subfolders within the input directory:
+```
+<input_dir>/<stem>/1H13C/
+<input_dir>/<stem>/13C1H/
+<input_dir>/<stem>/1Hx13C/
+```
+
+Usage:
+```bash
+python combine_nmr_inputs.py <directory_with_csvs>
+```
+
+---
+
+## ߧ Experiment Logging & Optimization
+
+- All scripts support **MLflow** for experiment tracking.
+- **Optuna** is used for hyperparameter optimization.
+- Optimization → 10CV evaluation → final training is fully automated.
+- Log artifacts include: metrics, predictions, model weights, hyperparameter plots, Williams plots (where applicable).
+
+To define your own tags, modify the corresponding `tags_config_*.py` files.
+
+---
+
+## ߓ Citation
+
+This repository supports the following manuscript:  
+**[Title Placeholder]**  
+*Authors: A. Leniak et al.*  
+*Submitted 2025*  
+DOI: *[Placeholder]*
+
+---
+
+## ߓ Contact
+
+For questions, bug reports, or collaboration ideas, please contact:
+
+**Arek Leniak**  
+[GitHub: Prospero1988](https://github.com/Prospero1988)
