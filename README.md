@@ -199,7 +199,5 @@ DOI: *[Placeholder]*
 
 ## Contact
 
-For questions, bug reports, or collaboration ideas, please contact:
+For questions, bug reports, or collaboration ideas, please feel free to contact me.
 
-**Arkadiusz Leniak**  
-[GitHub: Prospero1988](https://github.com/Prospero1988)
