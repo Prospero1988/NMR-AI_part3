@@ -2,7 +2,7 @@
   <img src="IMG/logo.png" alt="Project Logo" width="400px">
 </p>
 
-# NMR-AI_part3: Supplementary Data & Scripts for ML-Based logD Prediction
+# NMR-AI_part3: Input Data & Scripts
 
 This repository contains the datasets and source code used in the third publication of the *From NMR to AI* series:  
 **[Title Placeholder]**, *[DOI Placeholder]*.
