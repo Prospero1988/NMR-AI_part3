@@ -1,16 +1,26 @@
+<p align="center">
+  <img src="IMG/logo.png" alt="Project Logo" width="400px">
+</p>
+
 # NMR-AI_part3: Supplementary Data & Scripts for ML-Based logD Prediction
 
 This repository contains the datasets and source code used in the third publication of the *From NMR to AI* series:  
 **[Title Placeholder]**, *[DOI Placeholder]*.
 
+All scripts are fully integrated with **[MLflow](https://mlflow.org/)** for experiment tracking and **[Optuna](https://optuna.org/)** for hyperparameter optimization.  
+They support reproducible experiments, model comparison, and artifact logging across all stages of training and evaluation.
+
+> ⚠️ **Hardware Requirements:**  
+> - The machine learning scripts (SVR and XGBoost) require a CUDA-enabled NVIDIA GPU for execution.  
+> - Neural network scripts (CNNs, MLPs) can run on CPU, but training will be significantly slower.
+
 The work focuses on the prediction of CHI logD values using classical machine learning algorithms and neural network architectures trained on NMR spectral representations (¹H, ¹³C, and hybrid).
 
-All scripts follow the PEP8 standard and are integrated with **MLflow** for experiment tracking, and **Optuna** for hyperparameter optimization.  
-The repository supports Python 3.12.
+All scripts follow the PEP8 standard and support Python 3.12.
 
 ---
 
-## ߗ Repository Structure
+## Repository Structure
 
 ```
 NMR-AI_part3/
@@ -146,8 +156,7 @@ python combine_nmr_inputs.py <directory_with_csvs>
 ```
 
 ---
-
-## ߧ Experiment Logging & Optimization
+## Experiment Logging & Optimization
 
 - All scripts support **MLflow** for experiment tracking.
 - **Optuna** is used for hyperparameter optimization.
@@ -158,7 +167,7 @@ To define your own tags, modify the corresponding `tags_config_*.py` files.
 
 ---
 
-## ߓ Citation
+## Citation
 
 This repository supports the following manuscript:  
 **[Title Placeholder]**  
@@ -168,9 +177,9 @@ DOI: *[Placeholder]*
 
 ---
 
-## ߓ Contact
+## Contact
 
 For questions, bug reports, or collaboration ideas, please contact:
 
-**Arek Leniak**  
+**Arkadiusz Leniak**  
 [GitHub: Prospero1988](https://github.com/Prospero1988)
