@@ -65,6 +65,18 @@ def setup_logging(logger_name, log_file):
     return logger
 
 def check_input_directory(input_directory):
+    """
+    Check if the input directory exists and contains CSV files.
+
+    Args:
+        input_directory (str): Path to the input directory.
+
+    Returns:
+        list: Sorted list of CSV filenames.
+
+    Raises:
+        SystemExit: If the directory does not exist or contains no CSV files.
+    """
     if not os.path.exists(input_directory):
         logging.error(f"Directory {input_directory} does not exist.")
         sys.exit(1)
@@ -79,24 +91,39 @@ def check_input_directory(input_directory):
     return csv_files
 
 def load_data(file_path):
+    """
+    Load data from a CSV file, dropping the first column (e.g., MOLECULE_NAME).
+
+    Args:
+        file_path (str): Path to the CSV file.
+
+    Returns:
+        cp.ndarray: Data as a CuPy array.
+    """
     data = pd.read_csv(file_path)
-    # Drop the non-numeric column (if any)
-    data = data.iloc[:, 1:]  # Exclude MOLECULE_NAME or similar
+    # Drop the non-numeric column (if any), e.g., MOLECULE_NAME
+    data = data.iloc[:, 1:]
     return cp.asarray(data.values)  # Convert remaining data to CuPy array
 
 def log_search_space():
+    """
+    Log the hyperparameter search space as a dictionary artifact in MLflow.
+    """
     search_space = {
-        'C': ('float', 1e-5, 1e6, 'log'),  # Rozszerzony zakres C
-        'epsilon': ('float', 1e-7, 10.0, 'log'),  # Rozszerzony zakres epsilon
-        'kernel': ('categorical', ['rbf']),  # Kernel pozostaje 'rbf'
-        'tol': ('float', 1e-6, 1e-1, 'log'),  # Rozszerzony zakres tol
+        'C': ('float', 1e-5, 1e6, 'log'),  # Extended C range
+        'epsilon': ('float', 1e-7, 10.0, 'log'),  # Extended epsilon range
+        'kernel': ('categorical', ['rbf']),  # Kernel remains 'rbf'
+        'tol': ('float', 1e-6, 1e-1, 'log'),  # Extended tol range
         'max_iter': ('int', -1),  # Max iterations
         'gamma_type': ('categorical', ['scale', 'auto', 'float']),
-        'gamma': ('float', 1e-9, 1e3, 'log'),  # Rozszerzony zakres gamma
+        'gamma': ('float', 1e-9, 1e3, 'log'),  # Extended gamma range
     }
     mlflow.log_dict(search_space, 'hyperparameter_search_space.json')
 
 def log_environment():
+    """
+    Log the current conda environment or pip requirements as an MLflow artifact.
+    """
     try:
         # Export conda environment
         conda_env_file = 'conda_environment.yml'
@@ -113,6 +140,18 @@ def log_environment():
             logging.warning(f"Could not log pip requirements: {e}")
 
 def optimize_hyperparameters(X, y, logger, csv_file):
+    """
+    Optimize SVR hyperparameters using Optuna and log results to MLflow.
+
+    Args:
+        X (cp.ndarray): Feature matrix.
+        y (cp.ndarray): Target vector.
+        logger (logging.Logger): Logger instance.
+        csv_file (str): Name of the CSV file being processed.
+
+    Returns:
+        tuple: (best_params, study) where best_params is a dict of best hyperparameters and study is the Optuna study object.
+    """
     # Detect the number of GPUs
     num_gpus = cp.cuda.runtime.getDeviceCount()
     logger.info(f"Number of GPUs available: {num_gpus}")
@@ -121,6 +160,15 @@ def optimize_hyperparameters(X, y, logger, csv_file):
     optimize_hyperparameters.trial_data_list = []
 
     def objective(trial):
+        """
+        Objective function for Optuna hyperparameter optimization.
+
+        Args:
+            trial (optuna.trial.Trial): Optuna trial object.
+
+        Returns:
+            float: Mean RMSE across folds.
+        """
         # Assign GPU ID based on trial number
         gpu_id = trial.number % num_gpus
         cp.cuda.Device(gpu_id).use()  # Set the current GPU

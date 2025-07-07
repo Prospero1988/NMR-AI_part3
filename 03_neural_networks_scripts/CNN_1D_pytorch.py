@@ -4,7 +4,7 @@ Script for regression using 1D CNN with Optuna optimization and cross-validation
 
 Created on Fri Oct  4 10:22:24 2024
 
-@author: aleniak (modified)
+@author: Arkadiusz Leniak
 """
 
 import os
@@ -20,7 +20,7 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, m
 from scipy.stats import pearsonr
 import optuna
 import mlflow
-import mlflow.pytorch  # Import dla mlflow.pytorch
+import mlflow.pytorch  # Import for mlflow.pytorch
 from datetime import datetime
 import argparse
 import optuna.visualization.matplotlib as optuna_viz
@@ -28,12 +28,12 @@ import matplotlib.pyplot as plt
 import json
 from optuna import importance
 
-# Importowanie tagów MLflow z pliku tags_config_pytorch_CNN_1D.py
-import tags_config_pytorch_CNN_1D
+# Import MLflow tags from tags_config_pytorch_CNN_1D.py
+import tags_config_CNN_1D
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-# Ustawienie ziarna losowego dla powtarzalności wyników
+# Set random seed for reproducibility
 SEED = 88
 random.seed(SEED)
 np.random.seed(SEED)
@@ -42,15 +42,27 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 os.environ['PYTHONHASHSEED'] = str(SEED)
 
-# Wybór urządzenia (GPU lub CPU)
+# Select device (GPU or CPU)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class EarlyStopping:
-    """Early stops the training if validation loss doesn't improve after a given patience."""
+    """
+    Early stops the training if validation loss doesn't improve after a given patience.
+
+    Attributes:
+        patience (int): How long to wait after last time validation loss improved.
+        verbose (bool): If True, prints a message for each validation loss improvement.
+        delta (float): Minimum change in the monitored quantity to qualify as an improvement.
+        counter (int): Counts epochs with no improvement.
+        best_loss (float): Best recorded validation loss.
+        early_stop (bool): Whether early stopping was triggered.
+    """
 
     def __init__(self, patience=10, verbose=False, delta=0.0):
         """
+        Initialize EarlyStopping.
+
         Args:
             patience (int): How long to wait after last time validation loss improved.
             verbose (bool): If True, prints a message for each validation loss improvement.
@@ -64,6 +76,12 @@ class EarlyStopping:
         self.early_stop = False
 
     def __call__(self, val_loss):
+        """
+        Call method to check if validation loss improved.
+
+        Args:
+            val_loss (float): Current validation loss.
+        """
         if self.best_loss is None:
             self.best_loss = val_loss
             if self.verbose:
@@ -84,28 +102,54 @@ class EarlyStopping:
 
 
 def load_data(csv_path, target_column_name='LABEL'):
+    """
+    Load and preprocess data from a CSV file.
+
+    Args:
+        csv_path (str): Path to the CSV file.
+        target_column_name (str): Name of the target column (default: 'LABEL').
+
+    Returns:
+        tuple: Tuple containing feature matrix X and target vector y.
+
+    Raises:
+        FileNotFoundError: If the CSV file is not found.
+        pd.errors.EmptyDataError: If the CSV file is empty.
+        KeyError: If the target column is not found in the CSV file.
+        Exception: If any other error occurs during data loading.
+    """
     try:
         data = pd.read_csv(csv_path)
-        # Odrzucenie pierwszej kolumny (nazwy próbek)
+        # Drop the first column (sample names)
         data = data.drop(data.columns[0], axis=1)
         y = data[target_column_name].values
         X = data.drop(columns=[target_column_name]).values
         return X, y
     except FileNotFoundError:
-        print(f"Plik {csv_path} nie został znaleziony.")
+        print(f"File {csv_path} not found.")
         sys.exit(1)
     except pd.errors.EmptyDataError:
-        print(f"Brak danych w pliku {csv_path}.")
+        print(f"No data in file {csv_path}.")
         sys.exit(1)
     except KeyError:
-        print(f"Kolumna docelowa '{target_column_name}' nie została znaleziona w {csv_path}.")
+        print(f"Target column '{target_column_name}' not found in {csv_path}.")
         sys.exit(1)
     except Exception as e:
-        print(f"Wystąpił błąd podczas wczytywania danych z {csv_path}: {e}")
+        print(f"An error occurred while loading data from {csv_path}: {e}")
         sys.exit(1)
 
 
 def get_optimizer(trial, model_parameters):
+    """
+    Get the optimizer for the model based on the trial parameters.
+
+    Args:
+        trial (optuna.Trial): The Optuna trial object.
+        model_parameters (iterable): The model parameters to optimize.
+
+    Returns:
+        torch.optim.Optimizer: The selected optimizer.
+    """
     optimizer_name = trial.suggest_categorical('optimizer', ['adam', 'sgd', 'rmsprop', 'adamw'])
     learning_rate = trial.suggest_float('learning_rate', 1e-5, 1e-1, log=True)
 
@@ -126,7 +170,27 @@ def get_optimizer(trial, model_parameters):
 
 
 class Net(nn.Module):
+    """
+    Convolutional Neural Network (CNN) for regression tasks.
+
+    Args:
+        nn.Module (torch.nn.Module): Base class for all neural network modules in PyTorch.
+
+    Attributes:
+        conv (torch.nn.Sequential): Convolutional layers.
+        fc (torch.nn.Sequential): Fully connected layers.
+        regularization (str): Type of regularization ('none', 'l1', or 'l2').
+        reg_rate (float): Regularization rate.
+    """
+
     def __init__(self, trial, input_dim):
+        """
+        Initialize the CNN architecture.
+
+        Args:
+            trial (optuna.Trial): The Optuna trial object.
+            input_dim (int): Dimensionality of the input features.
+        """
         super(Net, self).__init__()
 
         # Activation function
@@ -166,30 +230,30 @@ class Net(nn.Module):
         for i in range(num_conv_layers):
             out_channels = trial.suggest_int(f'num_filters_l{i}', 16, 128, log=True)
 
-            # Sugestia padding
-            max_possible_padding = 3  # Możesz dostosować tę wartość
+            # Padding suggestion
+            max_possible_padding = 3  # You can adjust this value
             padding = trial.suggest_int(f'padding_l{i}', 0, max_possible_padding)
 
-            # Obliczenie maksymalnego kernel_size
+            # Calculate maximum kernel_size
             max_kernel_size = input_length + 2 * padding
-            max_kernel_size = min(max_kernel_size, 15)  # Oryginalny maksymalny kernel_size
+            max_kernel_size = min(max_kernel_size, 15)  # Original maximum kernel_size
             if max_kernel_size < 3:
-                max_kernel_size = 3  # Minimalny kernel_size
+                max_kernel_size = 3  # Minimum kernel_size
 
-            # Sugestia kernel_size z dostosowanym maksimum
+            # Suggest kernel_size with adjusted maximum
             kernel_size = trial.suggest_int(f'kernel_size_l{i}', 3, max_kernel_size, step=2)
 
-            # Sugestia stride
+            # Suggest stride
             stride = trial.suggest_int(f'stride_l{i}', 1, 3)
 
-            # Obliczenie output_length
+            # Calculate output_length
             numerator = input_length + 2 * padding - (kernel_size - 1) - 1
             if numerator < 0:
-                continue  # Pomiń tę kombinację hiperparametrów
+                continue  # Skip this hyperparameter combination
 
             output_length = numerator // stride + 1
             if output_length <= 0:
-                continue  # Pomiń tę kombinację hiperparametrów
+                continue  # Skip this hyperparameter combination
 
             conv_layers.append(nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding))
             if use_batch_norm:
@@ -198,7 +262,7 @@ class Net(nn.Module):
             if dropout_rate > 0.0:
                 conv_layers.append(nn.Dropout(dropout_rate))
             in_channels = out_channels
-            input_length = output_length  # Aktualizacja długości wejścia
+            input_length = output_length  # Update input length
 
         self.conv = nn.Sequential(*conv_layers)
 
@@ -225,6 +289,13 @@ class Net(nn.Module):
         self.apply(lambda m: self.init_weights(m, init_method))
 
     def init_weights(self, m, init_method):
+        """
+        Initialize weights of the model layers.
+
+        Args:
+            m (torch.nn.Module): The module (layer) to initialize.
+            init_method (str): The initialization method ('xavier', 'kaiming', or 'normal').
+        """
         if isinstance(m, nn.Conv1d) or isinstance(m, nn.Linear):
             if init_method == 'xavier':
                 nn.init.xavier_uniform_(m.weight)
@@ -236,6 +307,15 @@ class Net(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def forward(self, x):
+        """
+        Forward pass of the model.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Output tensor.
+        """
         # Reshape input for Conv1d: (batch_size, channels, length)
         x = x.unsqueeze(1)
         x = self.conv(x)
@@ -244,14 +324,39 @@ class Net(nn.Module):
         return x
 
 
-# Definicja klasy WrappedModel
+# Definition of WrappedModel class
 class WrappedModel(nn.Module):
+    """
+    Wrapped model for evaluation and inference.
+
+    Args:
+        nn.Module (torch.nn.Module): Base class for all neural network modules in PyTorch.
+
+    Attributes:
+        model (torch.nn.Module): The underlying model.
+    """
+
     def __init__(self, model):
+        """
+        Initialize the wrapped model.
+
+        Args:
+            model (torch.nn.Module): The model to wrap.
+        """
         super(WrappedModel, self).__init__()
         self.model = model
-        self.model.eval()  # Ustawienie modelu w trybie ewaluacji
+        self.model.eval()  # Set model to evaluation mode
 
     def forward(self, x):
+        """
+        Forward pass of the wrapped model.
+
+        Args:
+            x (torch.Tensor or np.ndarray): Input tensor or numpy array.
+
+        Returns:
+            torch.Tensor: Output tensor.
+        """
         if isinstance(x, np.ndarray):
             x = torch.from_numpy(x)
         x = x.type(torch.float32)
@@ -260,27 +365,37 @@ class WrappedModel(nn.Module):
 
 
 def objective(trial, csv_path):
+    """
+    Objective function for Optuna hyperparameter optimization.
+
+    Args:
+        trial (optuna.Trial): The Optuna trial object.
+        csv_path (str): Path to the CSV file.
+
+    Returns:
+        float: The value of the objective function (e.g., RMSE).
+    """
     try:
-        # Wczytanie i przetworzenie danych
+        # Load and preprocess data
         X_train_full, y_train_full = load_data(csv_path, target_column_name='LABEL')
 
-        # Konwersja do tensora
+        # Convert to tensor
         X_train_full = X_train_full.astype(np.float32)
         y_train_full = y_train_full.astype(np.float32)
 
-        # Podział danych na zbiory treningowy i testowy
+        # Split data into training and test sets
         X_train, X_test, y_train, y_test = train_test_split(
             X_train_full, y_train_full, test_size=0.1, random_state=SEED
         )
 
-        # Sugestia hiperparametrów
+        # Hyperparameter suggestions
         batch_size = trial.suggest_int('batch_size', 16, 128, log=True)
         epochs = trial.suggest_int('epochs', 50, 500, step=50)
         early_stop_patience = trial.suggest_int('early_stop_patience', 5, 20)
         use_scheduler = trial.suggest_categorical('use_scheduler', [True, False])
         clip_grad_value = trial.suggest_float('clip_grad_value', 0.1, 3.0, step=0.1)
 
-        # Walidacja krzyżowa KFold
+        # KFold cross-validation
         kf = KFold(n_splits=5, shuffle=True, random_state=SEED)
         rmse_scores = []
 
@@ -290,24 +405,24 @@ def objective(trial, csv_path):
             y_train_fold = y_train[train_index]
             y_valid_fold = y_train[valid_index]
 
-            # Tworzenie modelu
+            # Create model
             input_dim = X_train_fold.shape[1]
             model = Net(trial, input_dim).to(device)
 
-            # Kryterium straty
+            # Loss criterion
             criterion = nn.MSELoss()
 
-            # Optymalizator
+            # Optimizer
             optimizer = get_optimizer(trial, model.parameters())
 
-            # Schemat zmiany współczynnika uczenia
+            # Learning rate scheduler
             if use_scheduler:
                 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5)
 
             # Early stopping
             early_stopping = EarlyStopping(patience=early_stop_patience, verbose=False)
 
-            # Trenowanie
+            # Training
             dataset = torch.utils.data.TensorDataset(torch.tensor(X_train_fold, dtype=torch.float32),
                                                      torch.tensor(y_train_fold, dtype=torch.float32))
             loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
@@ -320,14 +435,14 @@ def objective(trial, csv_path):
 
                     optimizer.zero_grad()
 
-                    # Sprawdzenie rozmiaru batcha dla BatchNorm
+                    # Check batch size for BatchNorm
                     if batch_X.size(0) > 1:
                         outputs = model(batch_X).squeeze()
                         loss = criterion(outputs.view(-1), batch_y)
                     else:
-                        continue  # Pomijamy, jeśli batch_size == 1
+                        continue  # Skip if batch_size == 1
 
-                    # Dodanie regularizacji
+                    # Add regularization
                     if model.regularization == 'l1':
                         l1_norm = sum(p.abs().sum() for p in model.parameters())
                         loss = loss + model.reg_rate * l1_norm
@@ -344,7 +459,7 @@ def objective(trial, csv_path):
                 if use_scheduler:
                     scheduler.step(loss)
 
-                # Walidacja
+                # Validation
                 model.eval()
                 with torch.no_grad():
                     X_valid_tensor = torch.tensor(X_valid_fold, dtype=torch.float32).to(device)
@@ -353,12 +468,12 @@ def objective(trial, csv_path):
                     y_valid_true = y_valid_tensor.cpu().numpy()
                     val_loss = mean_squared_error(y_valid_true, y_valid_pred)
 
-                # Sprawdzenie early stopping
+                # Early stopping check
                 early_stopping(val_loss)
                 if early_stopping.early_stop:
                     break
 
-            # Ocena
+            # Evaluation
             model.eval()
             with torch.no_grad():
                 X_valid_tensor = torch.tensor(X_valid_fold, dtype=torch.float32).to(device)
@@ -369,36 +484,47 @@ def objective(trial, csv_path):
 
             rmse_scores.append(rmse)
 
-            # Zarządzanie pamięcią
+            # Memory management
             del model
             torch.cuda.empty_cache()
 
-        # Obliczenie średniego RMSE
+        # Calculate mean RMSE
         final_rmse = np.mean(rmse_scores)
 
-        # Logowanie metryki
+        # Log metric
         mlflow.log_metric("Trial RMSE", final_rmse, step=trial.number)
 
-        # Ustawienie atrybutów trialu
+        # Set trial attributes
         trial.set_user_attr('rmse', final_rmse)
 
         return final_rmse
 
     except Exception as e:
-        print(f"Wystąpił błąd w funkcji celu: {e}")
+        print(f"An error occurred in the objective function: {e}")
         raise e
 
 
 def evaluate_model_with_cv(csv_path, trial_params, csv_name):
+    """
+    Evaluate the model using cross-validation and log metrics and artifacts to MLflow.
+
+    Args:
+        csv_path (str): Path to the CSV file.
+        trial_params (dict): Dictionary containing the trial parameters.
+        csv_name (str): Name of the CSV file (for logging purposes).
+
+    Raises:
+        Exception: If any error occurs during model evaluation or logging.
+    """
     try:
-        # Wczytanie danych
+        # Load data
         X_full, y_full = load_data(csv_path, target_column_name='LABEL')
 
-        # Konwersja do tensora
+        # Convert to tensor
         X_full = X_full.astype(np.float32)
         y_full = y_full.astype(np.float32)
 
-        # Inicjalizacja K-fold cross-validation
+        # Initialize K-fold cross-validation
         kf = KFold(n_splits=10, shuffle=True, random_state=SEED)
 
         rmse_scores = []
@@ -406,14 +532,14 @@ def evaluate_model_with_cv(csv_path, trial_params, csv_name):
         r2_scores = []
         pearson_scores = []
 
-        # Zbiory do zbierania wszystkich prawdziwych i przewidzianych wartości
+        # Lists to collect all true and predicted values
         all_true = []
         all_preds = []
 
-        # Pobranie hiperparametrów z trial_params
+        # Get hyperparameters from trial_params
         params = trial_params
 
-        # Dodanie default dla brakujących parametrów
+        # Add defaults for missing parameters
         optimizer_name = params.get('optimizer', 'adam')
         learning_rate = params.get('learning_rate', 1e-3)
         adam_beta1 = params.get('adam_beta1', 0.9)
@@ -429,17 +555,17 @@ def evaluate_model_with_cv(csv_path, trial_params, csv_name):
             X_train, X_test = X_full[train_index], X_full[test_index]
             y_train, y_test = y_full[train_index], y_full[test_index]
 
-            # Tworzenie modelu z najlepszymi parametrami
+            # Create model with best parameters
             input_dim = X_train.shape[1]
-            # Uwaga: Musimy stworzyć obiekt trial z parametrami, aby przekazać go do Net
-            # Jednakże Net wymaga obiektu trial. Możemy stworzyć fikcyjny obiekt trial z parametrami.
+            # Note: We need to create a trial object with parameters to pass to Net
+            # However, Net requires a trial object. We can create a fake trial object with parameters.
             trial_for_model = optuna.trial.FixedTrial(params)
             model = Net(trial_for_model, input_dim).to(device)
 
-            # Kryterium straty
+            # Loss criterion
             criterion = nn.MSELoss()
 
-            # Optymalizator
+            # Optimizer
             if optimizer_name == 'adam':
                 optimizer = optim.Adam(model.parameters(), lr=learning_rate,
                                        betas=(adam_beta1, adam_beta2))
@@ -451,7 +577,7 @@ def evaluate_model_with_cv(csv_path, trial_params, csv_name):
                 optimizer = optim.AdamW(model.parameters(), lr=learning_rate,
                                         betas=(adam_beta1, adam_beta2))
             else:
-                raise ValueError(f"Nieznany optymalizator: {optimizer_name}")
+                raise ValueError(f"Unknown optimizer: {optimizer_name}")
 
             # Scheduler
             if use_scheduler:
@@ -460,7 +586,7 @@ def evaluate_model_with_cv(csv_path, trial_params, csv_name):
             # Early stopping
             early_stopping = EarlyStopping(patience=early_stop_patience, verbose=False)
 
-            # Trenowanie
+            # Training
             dataset = torch.utils.data.TensorDataset(torch.tensor(X_train, dtype=torch.float32),
                                                      torch.tensor(y_train, dtype=torch.float32))
             loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
@@ -477,9 +603,9 @@ def evaluate_model_with_cv(csv_path, trial_params, csv_name):
                         outputs = model(batch_X).squeeze()
                         loss = criterion(outputs, batch_y)
                     else:
-                        continue  # Pomijamy, jeśli batch_size == 1
+                        continue  # Skip if batch_size == 1
 
-                    # Dodanie regularizacji
+                    # Add regularization
                     if model.regularization == 'l1':
                         l1_norm = sum(p.abs().sum() for p in model.parameters())
                         loss = loss + model.reg_rate * l1_norm
@@ -496,7 +622,7 @@ def evaluate_model_with_cv(csv_path, trial_params, csv_name):
                 if use_scheduler:
                     scheduler.step(loss)
 
-                # Walidacja
+                # Validation
                 model.eval()
                 with torch.no_grad():
                     X_test_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
@@ -505,13 +631,13 @@ def evaluate_model_with_cv(csv_path, trial_params, csv_name):
                     y_valid_true = y_test_tensor.cpu().numpy()
                     val_loss = mean_squared_error(y_valid_true, y_valid_pred)
 
-                # Sprawdzenie early stopping
+                # Early stopping check
                 early_stopping(val_loss)
                 if early_stopping.early_stop:
                     print(f'Fold {fold}: Early stopping triggered at epoch {epoch+1}')
                     break
 
-            # Ocena
+            # Evaluation
             model.eval()
             with torch.no_grad():
                 y_test_pred = model(torch.tensor(X_test, dtype=torch.float32).to(device)).squeeze().cpu().numpy()
@@ -526,27 +652,27 @@ def evaluate_model_with_cv(csv_path, trial_params, csv_name):
             r2_scores.append(r2)
             pearson_scores.append(pearson_corr)
 
-            # Zbieranie predykcji
+            # Collect predictions
             all_true.extend(y_test_true)
             all_preds.extend(y_test_pred)
 
-            # Zarządzanie pamięcią
+            # Memory management
             del model
             torch.cuda.empty_cache()
 
-        # Obliczenie metryk
+        # Calculate metrics
         final_rmse = np.mean(rmse_scores)
         final_mae = np.mean(mae_scores)
         final_r2 = np.mean(r2_scores)
         final_pearson = np.mean(pearson_scores)
 
-        # Logowanie metryk
+        # Log metrics
         mlflow.log_metric("RMSE", final_rmse)
         mlflow.log_metric("MAE", final_mae)
         mlflow.log_metric("R2", final_r2)
         mlflow.log_metric("Pearson Correlation", final_pearson)
 
-        # Zapisanie metryk do pliku
+        # Save metrics to file
         summary = f"Best parameters:\n"
         for key, value in params.items():
             summary += f"{key}: {value}\n"
@@ -563,13 +689,13 @@ def evaluate_model_with_cv(csv_path, trial_params, csv_name):
 
         mlflow.log_artifact(summary_file_name)
 
-        print(f"\nOcena na zbiorze walidacyjnym dla {csv_name}:")
+        print(f"\nValidation set evaluation for {csv_name}:")
         print(f"  10CV RMSE: {final_rmse}")
         print(f"  10CV MAE: {final_mae}")
         print(f"  10CV R2: {final_r2}")
         print(f"  10CV Pearson Correlation: {final_pearson}")
 
-        # Generowanie wykresu
+        # Generate plot
         plt.figure(figsize=(8, 6))
         plt.scatter(all_true, all_preds, alpha=0.6, label='Predicted vs Actual')
         plt.plot([min(all_true), max(all_true)], [min(all_true), max(all_true)], color='red', linestyle='--', label='Ideal')
@@ -578,13 +704,13 @@ def evaluate_model_with_cv(csv_path, trial_params, csv_name):
         plt.title('Predicted vs Actual Values (Cross-Validation)')
         plt.legend()
 
-        # Zapisanie wykresu
+        # Save plot
         pred_vs_actual_fig_file = f"{csv_name}_pred_vs_actual_cv.png"
         plt.savefig(pred_vs_actual_fig_file)
         mlflow.log_artifact(pred_vs_actual_fig_file)
         plt.close()
 
-        # Zapisanie predykcji do CSV
+        # Save predictions to CSV
         predictions_df = pd.DataFrame({'Actual': all_true, 'Predicted': all_preds})
         predictions_file_name = f"{csv_name}_predictions.csv"
         predictions_df.to_csv(predictions_file_name, index=False)
@@ -593,23 +719,34 @@ def evaluate_model_with_cv(csv_path, trial_params, csv_name):
         print(f"Predictions saved as {predictions_file_name} and logged to MLflow.")
 
     except Exception as e:
-        print(f"Wystąpił błąd podczas ewaluacji modelu z walidacją krzyżową: {e}")
+        print(f"An error occurred during model evaluation with cross-validation: {e}")
         raise e
 
 
 def train_final_model(csv_path, trial_params, csv_name):
+    """
+    Train the final model on the entire dataset and log the model to MLflow.
+
+    Args:
+        csv_path (str): Path to the CSV file.
+        trial_params (dict): Dictionary containing the trial parameters.
+        csv_name (str): Name of the CSV file (for logging purposes).
+
+    Raises:
+        Exception: If any error occurs during final model training or logging.
+    """
     try:
-        # Wczytanie danych
+        # Load data
         X_full, y_full = load_data(csv_path, target_column_name='LABEL')
 
-        # Konwersja do tensora
+        # Convert to tensor
         X_full = X_full.astype(np.float32)
         y_full = y_full.astype(np.float32)
 
-        # Pobranie najlepszych hiperparametrów
+        # Get best hyperparameters
         params = trial_params
 
-        # Domyślne wartości dla brakujących parametrów
+        # Default values for missing parameters
         optimizer_name = params.get('optimizer', 'adam')
         learning_rate = params.get('learning_rate', 1e-3)
         adam_beta1 = params.get('adam_beta1', 0.9)
@@ -621,16 +758,16 @@ def train_final_model(csv_path, trial_params, csv_name):
         batch_size = params.get('batch_size', 32)
         epochs = params.get('epochs', 100)
 
-        # Tworzenie modelu z najlepszymi parametrami
+        # Create model with best parameters
         input_dim = X_full.shape[1]
-        # Uwaga: Ponownie tworzymy fikcyjny obiekt trial
+        # Again, create a fake trial object
         trial_for_model = optuna.trial.FixedTrial(params)
         model = Net(trial_for_model, input_dim).to(device)
 
-        # Kryterium straty
+        # Loss criterion
         criterion = nn.MSELoss()
 
-        # Optymalizator
+        # Optimizer
         if optimizer_name == 'adam':
             optimizer = optim.Adam(model.parameters(), lr=learning_rate,
                                    betas=(adam_beta1, adam_beta2))
@@ -642,7 +779,7 @@ def train_final_model(csv_path, trial_params, csv_name):
             optimizer = optim.AdamW(model.parameters(), lr=learning_rate,
                                     betas=(adam_beta1, adam_beta2))
         else:
-            raise ValueError(f"Nieznany optymalizator: {optimizer_name}")
+            raise ValueError(f"Unknown optimizer: {optimizer_name}")
 
         # Scheduler
         if use_scheduler:
@@ -651,7 +788,7 @@ def train_final_model(csv_path, trial_params, csv_name):
         # Early stopping
         early_stopping = EarlyStopping(patience=early_stop_patience, verbose=False)
 
-        # Trenowanie
+        # Training
         dataset = torch.utils.data.TensorDataset(torch.tensor(X_full, dtype=torch.float32),
                                                  torch.tensor(y_full, dtype=torch.float32))
         loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
@@ -668,9 +805,9 @@ def train_final_model(csv_path, trial_params, csv_name):
                     outputs = model(batch_X).squeeze()
                     loss = criterion(outputs, batch_y)
                 else:
-                    continue  # Pomijamy, jeśli batch_size == 1
+                    continue  # Skip if batch_size == 1
 
-                # Dodanie regularizacji
+                # Add regularization
                 if model.regularization == 'l1':
                     l1_norm = sum(p.abs().sum() for p in model.parameters())
                     loss = loss + model.reg_rate * l1_norm
@@ -687,29 +824,29 @@ def train_final_model(csv_path, trial_params, csv_name):
             if use_scheduler:
                 scheduler.step(loss)
 
-            # Sprawdzenie early stopping
+            # Early stopping check
             early_stopping(loss.item())
             if early_stopping.early_stop:
                 print(f'Final model: Early stopping triggered at epoch {epoch+1}')
                 break
 
-        # Zapisanie finalnego modelu
+        # Save final model
         model_file_name = f"{csv_name}_final_model.pth"
         torch.save(model.state_dict(), model_file_name)
         print(f"Final model saved as {model_file_name}")
 
-        # Przeniesienie modelu na CPU i ustawienie w trybie ewaluacji
+        # Move model to CPU and set to evaluation mode
         model.to('cpu')
         model.eval()
         model = model.float()
 
-        # Przygotowanie input_example
+        # Prepare input_example
         input_example = X_full[0:1].astype(np.float32)
 
-        # Stworzenie opakowanego modelu
+        # Create wrapped model
         wrapped_model = WrappedModel(model)
 
-        # Definicja conda_env
+        # Define conda_env
         conda_env = {
             'channels': ['defaults'],
             'dependencies': [
@@ -725,11 +862,11 @@ def train_final_model(csv_path, trial_params, csv_name):
             'name': 'mlflow-env'
         }
 
-        # Ustawienie poziomu logowania na DEBUG
+        # Set logging level to DEBUG
         import logging
         logging.getLogger("mlflow").setLevel(logging.DEBUG)
 
-        # Logowanie modelu do MLflow
+        # Log model to MLflow
         mlflow.pytorch.log_model(
             wrapped_model,
             artifact_path="model",
@@ -740,50 +877,50 @@ def train_final_model(csv_path, trial_params, csv_name):
         print(f"Final model logged to MLflow.")
 
     except Exception as e:
-        print(f"Wystąpił błąd podczas trenowania finalnego modelu: {e}")
+        print(f"An error occurred during final model training: {e}")
         raise e
 
 
 if __name__ == '__main__':
-    # Parsowanie argumentów linii poleceń
-    parser = argparse.ArgumentParser(description='Trenowanie modeli CNN na plikach CSV w katalogu.')
-    parser.add_argument('--csv_path', type=str, required=True, help='Ścieżka do katalogu zawierającego pliki CSV.')
-    parser.add_argument('--experiment_name', type=str, required=False, default='Default', help='Nazwa eksperymentu w MLflow.')
-    parser.add_argument('--n_trials', type=int, required=False, default=1000, help='Liczba prób dla optymalizacji hiperparametrów w Optuna')
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description='Train CNN models on CSV files in a directory.')
+    parser.add_argument('--csv_path', type=str, required=True, help='Path to the directory containing CSV files.')
+    parser.add_argument('--experiment_name', type=str, required=False, default='Default', help='MLflow experiment name.')
+    parser.add_argument('--n_trials', type=int, required=False, default=1000, help='Number of trials for Optuna hyperparameter optimization')
 
     args = parser.parse_args()
 
     csv_directory = args.csv_path
     experiment_name = args.experiment_name
 
-    # Ustawienie nazwy eksperymentu w MLflow
+    # Set MLflow experiment name
     mlflow.set_experiment(experiment_name)
 
-    # Sprawdzenie, czy katalog istnieje
+    # Check if directory exists
     if not os.path.isdir(csv_directory):
-        print(f"Podana ścieżka {csv_directory} nie jest katalogiem.")
+        print(f"The provided path {csv_directory} is not a directory.")
         sys.exit(1)
 
-    # Pobranie listy plików CSV
+    # Get list of CSV files
     csv_files = [f for f in os.listdir(csv_directory) if f.endswith('.csv')]
     if not csv_files:
-        print(f"Brak plików CSV w katalogu {csv_directory}")
+        print(f"No CSV files found in directory {csv_directory}")
         sys.exit(1)
 
-    # Iteracja po plikach CSV
+    # Iterate over CSV files
     for csv_file in csv_files:
         csv_path = os.path.join(csv_directory, csv_file)
         csv_name = os.path.splitext(csv_file)[0]
 
-        print(f"\nPrzetwarzanie pliku: {csv_file}")
+        print(f"\nProcessing file: {csv_file}")
 
         try:
-            # Run MLflow dla optymalizacji hiperparametrów
+            # Run MLflow for hyperparameter optimization
             with mlflow.start_run(
                 run_name=f"Optimization_{csv_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
-                tags=tags_config_pytorch_CNN_1D.mlflow_tags1
+                tags=tags_config_CNN_1D.mlflow_tags1
             ) as optuna_run:
-                # Wrapper funkcji celu
+                # Wrapper for objective function
                 def objective_wrapper(trial):
                     return objective(trial, csv_path)
 
@@ -792,13 +929,13 @@ if __name__ == '__main__':
 
                 torch.cuda.empty_cache()
 
-                # Logowanie najlepszych parametrów
-                best_trial = study.best_trial  # Zmieniamy nazwę zmiennej na best_trial
+                # Log best parameters
+                best_trial = study.best_trial  # Rename variable to best_trial
                 mlflow.log_param("best_value", best_trial.value)
                 for key, value in best_trial.params.items():
                     mlflow.log_param(key, value)
 
-                # Generowanie i logowanie wykresu ważności parametrów
+                # Generate and log parameter importance plot
                 importance_ax = optuna_viz.plot_param_importances(study)
                 importance_fig = importance_ax.get_figure()
                 importance_fig_file = f"{csv_name}_param_importance.png"
@@ -806,41 +943,41 @@ if __name__ == '__main__':
                 mlflow.log_artifact(importance_fig_file)
                 plt.close(importance_fig)
 
-                # Zapisanie ważności parametrów
+                # Save parameter importances
                 param_importances = importance.get_param_importances(study)
                 param_importances_file = f"{csv_name}_param_importance.json"
                 with open(param_importances_file, 'w') as f:
                     json.dump(param_importances, f, indent=4)
                 mlflow.log_artifact(param_importances_file)
 
-                # Logowanie metryk
+                # Log metrics
                 mlflow.log_metric("RMSE", best_trial.user_attrs.get('rmse', None))
 
-                print(f"Najlepszy trial dla {csv_file}:")
-                print(f"  Wartość (RMSE): {best_trial.value}")
-                print("  Parametry:")
+                print(f"Best trial for {csv_file}:")
+                print(f"  Value (RMSE): {best_trial.value}")
+                print("  Parameters:")
                 for key, value in best_trial.params.items():
                     print(f"    {key}: {value}")
 
-            # Przechowujemy najlepsze parametry poza blokiem with, aby były dostępne w kolejnych etapach
+            # Store best parameters outside the with block for use in next steps
             best_trial_params = best_trial.params
 
-            # Run MLflow dla ewaluacji modelu z 10-krotną walidacją krzyżową
+            # Run MLflow for model evaluation with 10-fold cross-validation
             with mlflow.start_run(
                 run_name=f"Evaluation_{csv_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
-                tags=tags_config_pytorch_CNN_1D.mlflow_tags2
+                tags=tags_config_CNN_1D.mlflow_tags2
             ) as evaluation_run:
-                # Ewaluacja modelu z 10CV
+                # Evaluate model with 10CV
                 evaluate_model_with_cv(csv_path, best_trial_params, csv_name)
 
-            # Run MLflow dla treningu finalnego modelu
+            # Run MLflow for final model training
             with mlflow.start_run(
                 run_name=f"Training_{csv_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
-                tags=tags_config_pytorch_CNN_1D.mlflow_tags3
+                tags=tags_config_CNN_1D.mlflow_tags3
             ) as training_run:
-                # Trenowanie finalnego modelu
+                # Train final model
                 train_final_model(csv_path, best_trial_params, csv_name)
 
         except Exception as e:
-            print(f"Wystąpił błąd podczas przetwarzania {csv_file}: {e}")
+            print(f"An error occurred while processing {csv_file}: {e}")
             continue

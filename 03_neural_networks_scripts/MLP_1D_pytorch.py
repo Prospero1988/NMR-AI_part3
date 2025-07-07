@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Uproszczony skrypt PyTorch z rozszerzoną optymalizacją
+Simplified PyTorch script with extended optimization.
 
 Created on Fri Oct  4 10:22:24 2024
 
-@author: aleniak
+@author: Arkadiusz Leniak
 """
 
 import os
@@ -20,7 +20,7 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from scipy.stats import pearsonr
 import optuna
 import mlflow
-import mlflow.pytorch  # Import dla mlflow.pytorch
+import mlflow.pytorch  # Import for mlflow.pytorch
 from datetime import datetime
 import argparse
 import optuna.visualization.matplotlib as optuna_viz
@@ -32,10 +32,10 @@ from optuna import importance
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-# Importowanie tagów MLflow z pliku tags_config_pytorch.py
-import tags_config_pytorch
+# Import MLflow tags from tags_config_pytorch.py
+import tags_config_MLP_1D
 
-# Ustawienie ziarna losowego dla powtarzalności wyników
+# Set random seed for reproducibility
 SEED = 88
 random.seed(SEED)
 np.random.seed(SEED)
@@ -44,15 +44,27 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 os.environ['PYTHONHASHSEED'] = str(SEED)
 
-# Wybór urządzenia (GPU lub CPU)
+# Select device (GPU or CPU)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class EarlyStopping:
-    """Early stops the training if validation loss doesn't improve after a given patience."""
-    
+    """
+    Early stops the training if validation loss doesn't improve after a given patience.
+
+    Attributes:
+        patience (int): How long to wait after last time validation loss improved.
+        verbose (bool): If True, prints a message for each validation loss improvement.
+        delta (float): Minimum change in the monitored quantity to qualify as an improvement.
+        counter (int): Counts epochs with no improvement.
+        best_loss (float): Best recorded validation loss.
+        early_stop (bool): Whether early stopping was triggered.
+    """
+
     def __init__(self, patience=10, verbose=False, delta=0.0):
         """
+        Initialize EarlyStopping.
+
         Args:
             patience (int): How long to wait after last time validation loss improved.
             verbose (bool): If True, prints a message for each validation loss improvement.
@@ -64,8 +76,14 @@ class EarlyStopping:
         self.counter = 0
         self.best_loss = None
         self.early_stop = False
-    
+
     def __call__(self, val_loss):
+        """
+        Call method to check if validation loss improved.
+
+        Args:
+            val_loss (float): Current validation loss.
+        """
         if self.best_loss is None:
             self.best_loss = val_loss
             if self.verbose:
@@ -86,6 +104,22 @@ class EarlyStopping:
 
 
 def load_data(csv_path, target_column_name='LABEL'):
+    """
+    Load data from a CSV file.
+
+    Args:
+        csv_path (str): Path to the CSV file.
+        target_column_name (str): Name of the target column.
+
+    Returns:
+        tuple: Features and target variable.
+
+    Raises:
+        FileNotFoundError: If the file is not found.
+        pd.errors.EmptyDataError: If the file is empty.
+        KeyError: If the target column is not found.
+        Exception: For any other exceptions.
+    """
     try:
         data = pd.read_csv(csv_path)
         # Odrzucenie pierwszej kolumny (nazwy próbek)
@@ -94,20 +128,30 @@ def load_data(csv_path, target_column_name='LABEL'):
         X = data.drop(columns=[target_column_name]).values
         return X, y
     except FileNotFoundError:
-        print(f"Plik {csv_path} nie został znaleziony.")
+        print(f"File {csv_path} not found.")
         sys.exit(1)
     except pd.errors.EmptyDataError:
-        print(f"Brak danych w pliku {csv_path}.")
+        print(f"No data in file {csv_path}.")
         sys.exit(1)
     except KeyError:
-        print(f"Kolumna docelowa '{target_column_name}' nie została znaleziona w {csv_path}.")
+        print(f"Target column '{target_column_name}' not found in {csv_path}.")
         sys.exit(1)
     except Exception as e:
-        print(f"Wystąpił błąd podczas wczytywania danych z {csv_path}: {e}")
+        print(f"Error loading data from {csv_path}: {e}")
         sys.exit(1)
 
 
 def get_optimizer(trial, model_parameters):
+    """
+    Get the optimizer based on the trial suggestion.
+
+    Args:
+        trial (optuna.Trial): The Optuna trial object.
+        model_parameters (iterable): Model parameters to optimize.
+
+    Returns:
+        torch.optim.Optimizer: The selected optimizer.
+    """
     optimizer_name = trial.suggest_categorical('optimizer', ['adam', 'sgd', 'rmsprop'])
     learning_rate = trial.suggest_float('learning_rate', 1e-5, 1e-1, log=True)
 
@@ -130,7 +174,27 @@ def get_optimizer(trial, model_parameters):
 
 
 class Net(nn.Module):
+    """
+    Neural network model.
+
+    Args:
+        nn (Module): Inherits from PyTorch nn.Module.
+
+    Attributes:
+        activation (callable): Activation function.
+        regularization (str): Regularization type ('none', 'l1', 'l2').
+        reg_rate (float): Regularization rate.
+        model (Sequential): Sequential model containing layers.
+    """
+
     def __init__(self, trial, input_dim):
+        """
+        Initialize the neural network.
+
+        Args:
+            trial (optuna.Trial): The Optuna trial object.
+            input_dim (int): Dimensionality of the input data.
+        """
         super(Net, self).__init__()
 
         # Activation function selection
@@ -168,6 +232,18 @@ class Net(nn.Module):
         self.apply(self.init_weights)
 
     def get_activation_function(self, name):
+        """
+        Get the activation function by name.
+
+        Args:
+            name (str): Name of the activation function.
+
+        Returns:
+            callable: The activation function.
+
+        Raises:
+            ValueError: If the activation function is not supported.
+        """
         if name == 'relu':
             return nn.ReLU()
         elif name == 'tanh':
@@ -182,6 +258,12 @@ class Net(nn.Module):
             raise ValueError(f"Unsupported activation function: {name}")
 
     def init_weights(self, m):
+        """
+        Initialize weights of the model layers.
+
+        Args:
+            m (Module): The layer module.
+        """
         if isinstance(m, nn.Linear):
             if self.init_method == 'xavier':
                 nn.init.xavier_uniform_(m.weight)
@@ -193,16 +275,50 @@ class Net(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def forward(self, x):
+        """
+        Forward pass of the model.
+
+        Args:
+            x (Tensor): Input tensor.
+
+        Returns:
+            Tensor: Output tensor.
+        """
         return self.model(x)
 
 # Definicja klasy WrappedModel
 class WrappedModel(nn.Module):
+    """
+    Wrapped model for evaluation.
+
+    Args:
+        nn (Module): Inherits from PyTorch nn.Module.
+
+    Attributes:
+        model (Module): The neural network model.
+    """
+
     def __init__(self, model):
+        """
+        Initialize the wrapped model.
+
+        Args:
+            model (Module): The neural network model.
+        """
         super(WrappedModel, self).__init__()
         self.model = model
         self.model.eval()  # Ustawienie modelu w trybie ewaluacji
 
     def forward(self, x):
+        """
+        Forward pass of the wrapped model.
+
+        Args:
+            x (Tensor or ndarray): Input tensor or numpy array.
+
+        Returns:
+            Tensor: Output tensor.
+        """
         if isinstance(x, np.ndarray):
             x = torch.from_numpy(x)
         x = x.type(torch.float32)
@@ -210,6 +326,19 @@ class WrappedModel(nn.Module):
             return self.model(x)
 
 def objective(trial, csv_path):
+    """
+    Objective function for Optuna trial.
+
+    Args:
+        trial (optuna.Trial): The Optuna trial object.
+        csv_path (str): Path to the CSV file.
+
+    Returns:
+        float: The RMSE metric for the trial.
+
+    Raises:
+        Exception: For any exceptions during the trial.
+    """
     try:
         # Wczytanie i przetworzenie danych
         X_train_full, y_train_full = load_data(csv_path, target_column_name='LABEL')
@@ -345,11 +474,22 @@ def objective(trial, csv_path):
         return final_rmse
 
     except Exception as e:
-        print(f"Wystąpił błąd w funkcji celu: {e}")
+        print(f"Error in objective function: {e}")
         raise e
 
 
 def evaluate_model_with_cv(csv_path, trial, csv_name):
+    """
+    Evaluate the model using cross-validation.
+
+    Args:
+        csv_path (str): Path to the CSV file.
+        trial (optuna.Trial): The Optuna trial object.
+        csv_name (str): Base name of the CSV file (for saving results).
+
+    Raises:
+        Exception: For any exceptions during evaluation.
+    """
     try:
         # Wczytanie danych
         X_full, y_full = load_data(csv_path, target_column_name='LABEL')
@@ -515,7 +655,7 @@ def evaluate_model_with_cv(csv_path, trial, csv_name):
 
         mlflow.log_artifact(summary_file_name)
 
-        print(f"\nOcena na zbiorze walidacyjnym dla {csv_file}:")
+        print(f"\nEvaluation on the validation set for {csv_file}:")
         print(f"  10CV RMSE: {final_rmse}")
         print(f"  10CV MAE: {final_mae}")
         print(f"  10CV R2: {final_r2}")
@@ -546,11 +686,22 @@ def evaluate_model_with_cv(csv_path, trial, csv_name):
 
 
     except Exception as e:
-        print(f"Wystąpił błąd podczas oceny modelu z walidacją krzyżową: {e}")
+        print(f"Error during model evaluation with cross-validation: {e}")
         raise e
 
 
 def train_final_model(csv_path, trial, csv_name):
+    """
+    Train the final model on the entire dataset.
+
+    Args:
+        csv_path (str): Path to the CSV file.
+        trial (optuna.Trial): The Optuna trial object.
+        csv_name (str): Base name of the CSV file (for saving the model).
+
+    Raises:
+        Exception: For any exceptions during training.
+    """
     try:
         # Wczytanie danych
         X_full, y_full = load_data(csv_path, target_column_name='LABEL')
@@ -635,15 +786,15 @@ def train_final_model(csv_path, trial, csv_name):
         print(f"Model logged to MLflow.")
 
     except Exception as e:
-        print(f"Wystąpił błąd podczas trenowania finalnego modelu: {e}")
+        print(f"Error training final model: {e}")
         raise e
 
 
 if __name__ == '__main__':
     # Parsowanie argumentów linii poleceń
-    parser = argparse.ArgumentParser(description='Trenowanie modeli DNN na plikach CSV w katalogu.')
-    parser.add_argument('--csv_path', type=str, required=True, help='Ścieżka do katalogu zawierającego pliki CSV.')
-    parser.add_argument('--experiment_name', type=str, required=False, default='Default', help='Nazwa eksperymentu w MLflow.')
+    parser = argparse.ArgumentParser(description='Train DNN models on CSV files in a directory.')
+    parser.add_argument('--csv_path', type=str, required=True, help='Path to the directory containing CSV files.')
+    parser.add_argument('--experiment_name', type=str, required=False, default='Default', help='Experiment name in MLflow.')
 
     args = parser.parse_args()
 
@@ -655,13 +806,13 @@ if __name__ == '__main__':
 
     # Sprawdzenie, czy katalog istnieje
     if not os.path.isdir(csv_directory):
-        print(f"Podana ścieżka {csv_directory} nie jest katalogiem.")
+        print(f"Provided path {csv_directory} is not a directory.")
         sys.exit(1)
 
     # Pobranie listy plików CSV
     csv_files = [f for f in os.listdir(csv_directory) if f.endswith('.csv')]
     if not csv_files:
-        print(f"Brak plików CSV w katalogu {csv_directory}")
+        print(f"No CSV files found in directory {csv_directory}")
         sys.exit(1)
 
     # Iteracja po plikach CSV
@@ -669,13 +820,13 @@ if __name__ == '__main__':
         csv_path = os.path.join(csv_directory, csv_file)
         csv_name = os.path.splitext(csv_file)[0]
 
-        print(f"\nPrzetwarzanie pliku: {csv_file}")
+        print(f"\nProcessing file: {csv_file}")
 
         try:
             # Rozpoczęcie runu MLflow dla optymalizacji hiperparametrów
             with mlflow.start_run(
                 run_name=f"Optimization_{csv_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
-                tags=tags_config_pytorch.mlflow_tags1
+                tags=tags_config_MLP_1D.mlflow_tags1
             ) as optuna_run:
                 # Definicja funkcji celu z przekazaniem csv_path
                 def objective_wrapper(trial):
@@ -723,16 +874,16 @@ if __name__ == '__main__':
                 mlflow.log_metric("RMSE", trial.user_attrs.get('rmse', None))
                 # Dodatkowe metryki mogą być logowane w funkcji evaluate_model_with_cv
 
-                print(f"Najlepszy trial dla {csv_file}:")
-                print(f"  Wartość (RMSE): {trial.value}")
-                print("  Parametry: ")
+                print(f"Best trial for {csv_file}:")
+                print(f"  Value (RMSE): {trial.value}")
+                print("  Parameters: ")
                 for key, value in trial.params.items():
                     print(f"    {key}: {value}")
 
             # Rozpoczęcie nowego runu MLflow dla oceny modelu z walidacją krzyżową
             with mlflow.start_run(
                 run_name=f"Evaluation_{csv_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
-                tags=tags_config_pytorch.mlflow_tags2
+                tags=tags_config_MLP_1D.mlflow_tags2
             ) as evaluation_run:
                 # Ocena modelu z użyciem 10-krotnej walidacji krzyżowej
                 evaluate_model_with_cv(csv_path, trial, csv_name)
@@ -740,11 +891,11 @@ if __name__ == '__main__':
             # Rozpoczęcie nowego runu MLflow dla treningu finalnego modelu
             with mlflow.start_run(
                 run_name=f"Training_{csv_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
-                tags=tags_config_pytorch.mlflow_tags3
+                tags=tags_config_MLP_1D.mlflow_tags3
             ) as training_run:
                 # Trenowanie finalnego modelu
                 train_final_model(csv_path, trial, csv_name)
 
         except Exception as e:
-            print(f"Wystąpił błąd podczas przetwarzania {csv_file}: {e}")
+            print(f"Error processing {csv_file}: {e}")
             continue

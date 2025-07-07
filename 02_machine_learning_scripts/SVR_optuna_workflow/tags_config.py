@@ -9,17 +9,8 @@ mlflow_tags1 = {
 }
 
 mlflow_tags2 = {
-    "predictor": "1H_conc_13C",
+    "predictor": "1H",
     "evaluation": "10CV",
-    "model": "SVR",
-    "stage": "training",
-    "author": "aleniak",
-    "property": "CHIlogD"
-}
-
-mlflow_tags3 = {
-    "predictor": "1H_conc_13C",
-    "evaluation": "LOO",
     "model": "SVR",
     "stage": "training",
     "author": "aleniak",

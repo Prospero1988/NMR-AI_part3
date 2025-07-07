@@ -31,9 +31,24 @@ warnings.filterwarnings("ignore", message="Setuptools is replacing distutils")
 logging.basicConfig(level=logging.INFO)
 
 def main():
-    parser = argparse.ArgumentParser(description='SVR Model Training with MLflow and 10-fold Cross-Validation')
-    parser.add_argument('input_directory', type=str, help='Path to the input directory containing CSV files')
-    parser.add_argument('--experiment_name', type=str, default='Default', help='Name of the MLflow experiment')
+    """
+    Main function for SVR model training with MLflow and 10-fold cross-validation.
+    Parses command-line arguments, sets up MLflow experiment, and processes each CSV file.
+    """
+    parser = argparse.ArgumentParser(
+        description='SVR Model Training with MLflow and 10-fold Cross-Validation'
+    )
+    parser.add_argument(
+        'input_directory',
+        type=str,
+        help='Path to the input directory containing CSV files'
+    )
+    parser.add_argument(
+        '--experiment_name',
+        type=str,
+        default='Default',
+        help='Name of the MLflow experiment'
+    )
     args = parser.parse_args()
 
     input_directory = args.input_directory
@@ -51,6 +66,16 @@ def main():
             mlflow.end_run()
 
 def setup_logging(logger_name, log_file):
+    """
+    Set up logging to both file and console.
+
+    Args:
+        logger_name (str): Name of the logger.
+        log_file (str): Path to the log file.
+
+    Returns:
+        logging.Logger: Configured logger instance.
+    """
     logger = logging.getLogger(logger_name)
     logger.setLevel(logging.INFO)
 
@@ -75,6 +100,18 @@ def setup_logging(logger_name, log_file):
     return logger
 
 def check_input_directory(input_directory):
+    """
+    Check if the input directory exists and contains CSV files.
+
+    Args:
+        input_directory (str): Path to the input directory.
+
+    Returns:
+        list: Sorted list of CSV filenames.
+
+    Raises:
+        SystemExit: If the directory does not exist or contains no CSV files.
+    """
     if not os.path.exists(input_directory):
         logging.error(f"Directory {input_directory} does not exist.")
         sys.exit(1)
@@ -89,17 +126,48 @@ def check_input_directory(input_directory):
     return csv_files
 
 def load_data(file_path):
+    """
+    Load data from a CSV file, dropping the first column (e.g., MOLECULE_NAME).
+
+    Args:
+        file_path (str): Path to the CSV file.
+
+    Returns:
+        pd.DataFrame: Data as a pandas DataFrame.
+    """
     data = pd.read_csv(file_path)
-    # Drop the non-numeric column (if any)
-    data = data.iloc[:, 1:]  # Exclude MOLECULE_NAME or similar
+    # Drop the non-numeric column (if any), e.g., MOLECULE_NAME
+    data = data.iloc[:, 1:]
     return data  # Return as pandas DataFrame
 
 def train_final_model(X, y, best_params):
+    """
+    Train an SVR model on the provided data.
+
+    Args:
+        X (np.ndarray): Feature matrix.
+        y (np.ndarray): Target vector.
+        best_params (dict): Hyperparameters for SVR.
+
+    Returns:
+        SVR: Trained SVR model.
+    """
     model = SVR(**best_params)
     model.fit(X, y)
     return model
 
 def evaluate_model(model, X, y):
+    """
+    Evaluate the model and compute metrics.
+
+    Args:
+        model (SVR): Trained SVR model.
+        X (np.ndarray): Feature matrix.
+        y (np.ndarray): Target vector.
+
+    Returns:
+        tuple: (metrics dict, per-instance DataFrame)
+    """
     y_pred = model.predict(X)
 
     # Compute metrics using NumPy
@@ -114,7 +182,6 @@ def evaluate_model(model, X, y):
     rmse = mean_squared_error(y, y_pred, squared=False)
     mae = mean_absolute_error(y, y_pred)
     mae_std = np.std(abs_error)
-
     r2 = r2_score(y, y_pred)
 
     # Pearson correlation coefficient
@@ -134,10 +201,29 @@ def evaluate_model(model, X, y):
     return metrics, per_instance_data
 
 def save_model(model, file_name, logger):
+    """
+    Save the trained model to a file.
+
+    Args:
+        model (SVR): Trained SVR model.
+        file_name (str): Path to save the model.
+        logger (logging.Logger): Logger instance.
+    """
     joblib.dump(model, file_name)
     logger.info(f"Model saved to {file_name}")
 
 def save_metrics_and_params(avg_metrics, params, file_name, logger, fold_metrics_list=None, final_metrics=None):
+    """
+    Save metrics and hyperparameters to a text file.
+
+    Args:
+        avg_metrics (dict): Average metrics over folds.
+        params (dict): Model hyperparameters.
+        file_name (str): Path to save the file.
+        logger (logging.Logger): Logger instance.
+        fold_metrics_list (list, optional): List of per-fold metrics.
+        final_metrics (dict, optional): Metrics for the final model.
+    """
     with open(file_name, 'w', encoding='utf-8') as f:
         f.write(f"Model Status: Trained new model with 10-fold Cross-Validation\n\n")
         f.write("Hyperparameters:\n")
@@ -159,6 +245,13 @@ def save_metrics_and_params(avg_metrics, params, file_name, logger, fold_metrics
     logger.info(f"Metrics and hyperparameters saved to {file_name}")
 
 def process_file(csv_file, input_directory):
+    """
+    Process a single CSV file: load data, train and evaluate model, log results.
+
+    Args:
+        csv_file (str): Name of the CSV file.
+        input_directory (str): Path to the input directory.
+    """
     try:
         data = load_data(os.path.join(input_directory, csv_file))
 
@@ -307,7 +400,15 @@ def process_file(csv_file, input_directory):
             mlflow.log_param(f'Exception_{csv_file}', str(e))
 
 def adjust_hyperparameters(best_params):
-    # Adjust hyperparameters to be compatible with scikit-learn's SVR
+    """
+    Adjust hyperparameters to be compatible with scikit-learn's SVR.
+
+    Args:
+        best_params (dict): Hyperparameters from optimization.
+
+    Returns:
+        dict: Adjusted hyperparameters.
+    """
     # Handle 'gamma_type' and set 'gamma' accordingly
     gamma_type = best_params.pop('gamma_type', 'scale')  # Default to 'scale' if not present
     if gamma_type == 'float':
@@ -329,6 +430,9 @@ def adjust_hyperparameters(best_params):
     return best_params
 
 def log_environment():
+    """
+    Log the current conda environment or pip requirements as an MLflow artifact.
+    """
     try:
         # Export conda environment
         conda_env_file = 'conda_environment.yml'
@@ -345,6 +449,15 @@ def log_environment():
             logging.warning(f"Could not log pip requirements: {e}")
 
 def generate_and_log_plots(y_true, y_pred, csv_file, suffix=''):
+    """
+    Generate and log plots for actual vs predicted and residuals.
+
+    Args:
+        y_true (np.ndarray): True target values.
+        y_pred (np.ndarray): Predicted values.
+        csv_file (str): Name of the CSV file.
+        suffix (str): Suffix for plot filenames.
+    """
     # Plot Actual vs Predicted
     plt.figure(figsize=(8, 6))
     plt.scatter(y_true, y_pred, alpha=0.7)

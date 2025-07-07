@@ -1,13 +1,13 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Skrypt (tylko CNN 2D) do regresji na danych NMR (¹H + ¹³C),
-ale w alternatywnym formacie danych:
-(N, 1, 2, 200), czyli 1 kanał, wysokość=2, szerokość=200.
+2D CNN regression script for NMR data (¹H + ¹³C),
+with data format:
+(N, 1, 2, 200), i.e., 1 channel, height=2, width=200.
 
-W trakcie optymalizacji (Optuna) używa 3CV, finalnie 10CV. Logowanie w MLflow,
-lokalny katalog wyników, historia triali Optuny, ważność hiperparametrów,
-wykres błędu i wykres RMSE vs ID triala.
+During Optuna optimization, uses 3-fold CV; final evaluation uses 10-fold CV.
+Logging with MLflow, local results directory, Optuna trials history,
+hyperparameter importance, error plot, and RMSE vs. trial ID plot.
 """
 
 import argparse
@@ -37,14 +37,13 @@ import mlflow.pytorch
 from optuna.importance import get_param_importances
 import optuna.visualization.matplotlib as optuna_viz
 
-
 # ---------------------------------------------------------------------------------
-# Tagi MLflow (opcjonalnie)
+# MLflow tags (optional)
 # ---------------------------------------------------------------------------------
 MLFLOW_TAGS = {
     "property": "CHI logD",
-    "model": "CNN-only 2D (alt data format)",
-    "predictor": "1Hx13C"
+    "model": "CNN_2D_Stacked_Vectors",
+    "predictor": "1H, 13C"
 }
 
 # =================================================================================
@@ -52,7 +51,7 @@ MLFLOW_TAGS = {
 # =================================================================================
 class NMRDataset(Dataset):
     """
-    Dataset przyjmuje tensory o kształcie (N, 1, 2, 200).
+    Dataset for NMR data with shape (N, 1, 2, 200).
     """
     def __init__(self, nmr_data, labels):
         self.nmr_data = nmr_data  # (N, 1, 2, 200)
@@ -67,10 +66,10 @@ class NMRDataset(Dataset):
 
 def load_nmr_data(path_1h, path_13c):
     """
-    Ładuje i łączy dane ¹H i ¹³C w jeden tensor o kształcie (N, 1, 2, 200).
-    - "wysokość" = 2 (rząd 1: ¹H, rząd 2: ¹³C)
-    - "szerokość" = 200
-    - 1 kanał (channel=1)
+    Loads and merges ¹H and ¹³C data into a single tensor of shape (N, 1, 2, 200).
+    - "height" = 2 (row 1: ¹H, row 2: ¹³C)
+    - "width" = 200
+    - 1 channel (channel=1)
     """
     df_1h = pd.read_csv(path_1h)
     df_13c = pd.read_csv(path_13c)
@@ -86,19 +85,22 @@ def load_nmr_data(path_1h, path_13c):
     x_h = merged[h_cols].values  # (N, 200)
     x_c = merged[c_cols].values  # (N, 200)
 
-    # Kształt po stackowaniu: (N, 2, 200)
+    # After stacking: (N, 2, 200)
     x_nmr = np.stack([x_h, x_c], axis=1)
 
-    # Zmieniamy na (N, 1, 2, 200) => 1 kanał, "wysokość" = 2, "szerokość" = 200
-    x_nmr = x_nmr[:, np.newaxis, :, :]  # dodajemy wymiar kanałów na pozycji 1
+    # Change to (N, 1, 2, 200) => 1 channel, height = 2, width = 200
+    x_nmr = x_nmr[:, np.newaxis, :, :]  # add channel dimension at position 1
 
     y = merged["LABEL"].values
     return x_nmr, y
 
 # =================================================================================
-# Model CNN - alternatywny kształt danych
+# CNN Model - alternative data shape
 # =================================================================================
 class CNN2DAlt(nn.Module):
+    """
+    2D CNN model for NMR data with alternative data shape.
+    """
     def __init__(self, trial):
         super(CNN2DAlt, self).__init__()
 
@@ -110,7 +112,7 @@ class CNN2DAlt(nn.Module):
         conv_layers = []
         in_channels = 1
 
-        # --- Pierwsza warstwa: kernel=(2, kernel_size_w)
+        # First layer: kernel=(2, kernel_size_w)
         out_channels = trial.suggest_int(f"cnn_out_channels_l0", 8, 256, log=True)
         conv_layers.append(
             nn.Conv2d(
@@ -128,7 +130,7 @@ class CNN2DAlt(nn.Module):
 
         in_channels = out_channels
 
-        # --- Pozostałe warstwy: kernel=(1, kernel_size_w)
+        # Remaining layers: kernel=(1, kernel_size_w)
         for i in range(1, num_conv_layers):
             out_channels = trial.suggest_int(f"cnn_out_channels_l{i}", 8, 256, log=True)
 
@@ -150,7 +152,7 @@ class CNN2DAlt(nn.Module):
 
         self.conv = nn.Sequential(*conv_layers)
 
-        # linear po global poolu
+        # Linear after global pooling
         linear_out = trial.suggest_int("cnn_linear_out", 16, 256, log=True)
         self.fc_conv = nn.Linear(in_channels, linear_out)
 
@@ -166,9 +168,9 @@ class CNN2DAlt(nn.Module):
     def forward(self, x):
         # x: (B, 1, 2, W)
         x = self.conv(x)
-        # Po pierwszej warstwie będzie (B, out_channels, 1, W') => po każdej kolejnej też (B, out_channels, 1, W'')
+        # After first layer: (B, out_channels, 1, W'), after each next: (B, out_channels, 1, W''')
 
-        # Global average pooling w wymiarze szerokości
+        # Global average pooling over width
         x = torch.mean(x, dim=3)  # => (B, out_channels, 1)
 
         x = x.squeeze(2)  # => (B, out_channels)
@@ -177,18 +179,27 @@ class CNN2DAlt(nn.Module):
         return out.squeeze(1)
 
 # =================================================================================
-# Pomocnicze funkcje
+# Utility functions
 # =================================================================================
 def set_seed(seed=1988):
+    """
+    Set random seed for reproducibility.
+    """
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
 def get_device():
+    """
+    Get available device (CUDA or CPU).
+    """
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def train_one_epoch(model, loader, optimizer, loss_fn, device):
+    """
+    Train the model for one epoch.
+    """
     model.train()
     running_loss = 0.0
     for x_nmr, y in loader:
@@ -204,6 +215,9 @@ def train_one_epoch(model, loader, optimizer, loss_fn, device):
     return running_loss / len(loader.dataset)
 
 def validate(model, loader, loss_fn, device):
+    """
+    Validate the model.
+    """
     model.eval()
     y_true = []
     y_pred = []
@@ -226,6 +240,9 @@ def validate(model, loader, loss_fn, device):
     return val_loss / len(loader.dataset), rmse, y_true, y_pred
 
 def create_model_and_optimizer(trial):
+    """
+    Create a CNN2DAlt model and optimizer based on Optuna trial parameters.
+    """
     model = CNN2DAlt(trial)
     optimizer_name = trial.suggest_categorical("optimizer", ["Adam", "SGD", "RMSProp"])
     lr = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
@@ -239,9 +256,12 @@ def create_model_and_optimizer(trial):
     return model, optimizer
 
 # =================================================================================
-# 10CV
+# 10-fold Cross-Validation
 # =================================================================================
 def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epochs=50):
+    """
+    Perform n-fold cross-validation and return metrics and predictions.
+    """
     kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
     indices = np.arange(len(dataset))
 
@@ -316,6 +336,10 @@ def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epoch
 # Objective (3CV) - CNNOnly (alt data shape)
 # =================================================================================
 def objective(trial, dataset, device):
+    """
+    Objective function for Optuna hyperparameter optimization using 3-fold cross-validation.
+    Returns the average RMSE across folds.
+    """
     batch_size = trial.suggest_int("batch_size", 16, 256, log=True)
     max_epochs = 50
 
@@ -363,19 +387,24 @@ def objective(trial, dataset, device):
 # main()
 # =================================================================================
 def main():
+    """
+    Main function for running the 2D CNN regression pipeline on NMR data.
+    Handles argument parsing, logging, data loading, Optuna optimization,
+    and final evaluation with 10-fold cross-validation.
+    """
     parser = argparse.ArgumentParser()
-    parser.add_argument("--path_1h", required=True)
-    parser.add_argument("--path_13c", required=True)
-    parser.add_argument("--experiment_name", default="CNNOnly_AltData_Experiment")
-    parser.add_argument("--n_trials", default=20, type=int)
-    parser.add_argument("--epochs_10cv", default=50, type=int)
+    parser.add_argument("--path_1h", required=True, help="Path to 1H NMR input CSV file.")
+    parser.add_argument("--path_13c", required=True, help="Path to 13C NMR input CSV file.")
+    parser.add_argument("--experiment_name", default="CNNOnly_AltData_Experiment", help="MLflow experiment name.")
+    parser.add_argument("--n_trials", default=20, type=int, help="Number of Optuna trials.")
+    parser.add_argument("--epochs_10cv", default=50, type=int, help="Epochs for 10-fold CV.")
     args = parser.parse_args()
 
     set_seed(1988)
     device = get_device()
 
     # --------------------------------------------------------------------------
-    # Katalog wyników i logger
+    # Results directory and logger
     # --------------------------------------------------------------------------
     filename_1h = os.path.basename(args.path_1h)
     prefix = filename_1h.split("_")[0]
@@ -392,27 +421,27 @@ def main():
         ]
     )
     logger = logging.getLogger(__name__)
-    logger.info("Start skryptu (CNNOnly, alt). Katalog wynikowy: %s", res_dir)
+    logger.info("Script started (CNNOnly, alt). Results directory: %s", res_dir)
 
     try:
-        logger.info("Uruchomienie na urządzeniu: %s", device)
+        logger.info("Running on device: %s", device)
         X_nmr, y = load_nmr_data(args.path_1h, args.path_13c)
-        # Teraz X_nmr ma kształt (N, 1, 2, 200)
+        # Now X_nmr has shape (N, 1, 2, 200)
 
-        # Tworzymy tensory
-        X_nmr_t = torch.from_numpy(X_nmr).float()  # bez unsqueeze, bo mamy już (N,1,2,200)
+        # Create tensors
+        X_nmr_t = torch.from_numpy(X_nmr).float()  # already (N,1,2,200)
         y_t = torch.from_numpy(y).float()
 
         dataset = NMRDataset(X_nmr_t, y_t)
 
         mlflow.set_experiment(args.experiment_name)
         study = optuna.create_study(direction="minimize")
-        logger.info("Rozpoczynam study.optimize (n_trials=%d)", args.n_trials)
+        logger.info("Starting study.optimize (n_trials=%d)", args.n_trials)
         study.optimize(lambda tr: objective(tr, dataset, device), n_trials=args.n_trials)
 
         best_params = study.best_params
         best_value = study.best_value
-        logger.info("Optuna zakończona. Najlepsze parametry: %s, RMSE=%f", best_params, best_value)
+        logger.info("Optuna finished. Best parameters: %s, RMSE=%f", best_params, best_value)
 
         with mlflow.start_run(run_name="CNNOnly_10CV_AltData") as run:
             run_tags = dict(MLFLOW_TAGS)
@@ -422,13 +451,13 @@ def main():
             mlflow.log_param("n_trials", args.n_trials)
             mlflow.log_param("epochs_10cv", args.epochs_10cv)
 
-            # (1) Historia triali
+            # (1) Trials history
             df_trials = study.trials_dataframe(attrs=("number", "value", "params", "state"))
             csv_optuna = os.path.join(res_dir, "optuna_trials_cnnonly_alt.csv")
             df_trials.to_csv(csv_optuna, index=False)
             mlflow.log_artifact(csv_optuna)
 
-            # Wykres RMSE vs Trial ID
+            # RMSE vs Trial ID plot
             plot_trials_path = os.path.join(res_dir, "optuna_trials_rmse_cnnonly_alt.png")
             fig = plt.figure()
             plt.plot(df_trials["number"], df_trials["value"], marker="o", linestyle="-")
@@ -440,7 +469,7 @@ def main():
             mlflow.log_artifact(plot_trials_path)
             plt.close(fig)
 
-            # (2) Ważność hiperparametrów
+            # (2) Hyperparameter importance
             param_importances = get_param_importances(study)
             json_path = os.path.join(res_dir, "param_importances_cnnonly_alt.json")
             with open(json_path, "w") as f:
@@ -454,7 +483,7 @@ def main():
             mlflow.log_artifact(fig_imp_path)
             plt.close(fig_real)
 
-            # (3) 10CV z najlepszymi parametrami
+            # (3) 10CV with best hyperparameters
             def best_model_func():
                 class FrozenTrialStub:
                     def suggest_int(self, name, low, high, step=None, log=False):
@@ -476,7 +505,7 @@ def main():
                     opt = optim.RMSprop(model.parameters(), lr=lr)
                 return model, opt
 
-            logger.info("Rozpoczynam 10CV z parametrami: %s", best_params)
+            logger.info("Starting 10CV with parameters: %s", best_params)
             results = cross_validate(
                 model_func=best_model_func,
                 dataset=dataset,
@@ -497,10 +526,10 @@ def main():
 
             y_true_all = results["y_true_all"]
             y_pred_all = results["y_pred_all"]
-            logger.info("10CV zakończone. RMSE=%.4f±%.4f, MAE=%.4f±%.4f",
+            logger.info("10CV finished. RMSE=%.4f±%.4f, MAE=%.4f±%.4f",
                         rmse_mean, rmse_std, mae_mean, mae_std)
 
-            # <-- TU DODAŁEMY LOGOWANIE PARAMETRÓW DO MLflow
+            # Log metrics to MLflow
             mlflow.log_metric("rmse_mean_10cv", rmse_mean)
             mlflow.log_metric("rmse_std_10cv", rmse_std)
             mlflow.log_metric("mae_mean_10cv", mae_mean)
@@ -510,7 +539,7 @@ def main():
             mlflow.log_metric("pearson_mean_10cv", pearson_mean)
             mlflow.log_metric("pearson_std_10cv", pearson_std)
 
-            # Zapis metrics
+            # Save metrics
             metrics_path = os.path.join(res_dir, "metrics_cnnonly_alt.csv")
             with open(metrics_path, "w") as f:
                 f.write("metric,mean,std\n")
@@ -520,7 +549,7 @@ def main():
                 f.write(f"pearson,{pearson_mean},{pearson_std}\n")
             mlflow.log_artifact(metrics_path)
 
-            # hyperparams
+            # Save hyperparameters
             hyperparams_path = os.path.join(res_dir, "hyperparams_cnnonly_alt.csv")
             with open(hyperparams_path, "w") as f:
                 f.write("param,value\n")
@@ -528,7 +557,7 @@ def main():
                     f.write(f"{k},{v}\n")
             mlflow.log_artifact(hyperparams_path)
 
-            # csv z predykcjami
+            # Save predictions
             fold_indices_all = results["fold_indices_all"]
             df_cv = pd.DataFrame({
                 "fold": fold_indices_all,
@@ -539,30 +568,30 @@ def main():
             df_cv.to_csv(cv_csv_path, index=False)
             mlflow.log_artifact(cv_csv_path)
 
-            # Wykres y_true vs y_pred
+            # Plot y_true vs y_pred
             plot_path = os.path.join(res_dir, "real_vs_pred_plot_cnnonly_alt.png")
-            plt.figure(figsize=(6,6))
+            plt.figure(figsize=(6, 6))
             plt.scatter(y_true_all, y_pred_all, alpha=0.5)
-            plt.xlabel("Rzeczywiste y")
-            plt.ylabel("Przewidywane y")
+            plt.xlabel("True y")
+            plt.ylabel("Predicted y")
             plt.title("CNNOnly (alt data): Real vs. Pred (10CV)")
             plt.savefig(plot_path, dpi=300, bbox_inches="tight")
             mlflow.log_artifact(plot_path)
             plt.close()
 
-            # Wykres błędu
+            # Plot absolute error
             error_plot = os.path.join(res_dir, "error_plot_cnnonly_alt.png")
-            plt.figure(figsize=(6,6))
+            plt.figure(figsize=(6, 6))
             abs_error = np.abs(y_true_all - y_pred_all)
             plt.scatter(y_true_all, abs_error, alpha=0.5)
-            plt.xlabel("Rzeczywiste y")
+            plt.xlabel("True y")
             plt.ylabel("|y_true - y_pred|")
-            plt.title("Błąd bezwzględny vs. y_true (10CV) - CNNOnly alt")
+            plt.title("Absolute error vs. y_true (10CV) - CNNOnly alt")
             plt.savefig(error_plot, dpi=300, bbox_inches="tight")
             mlflow.log_artifact(error_plot)
             plt.close()
 
-            # (4) Trening finalny modelu na całym zbiorze
+            # (4) Final model training on the whole dataset
             final_model, final_optimizer = best_model_func()
             final_model.to(device)
             loss_fn = nn.MSELoss()
@@ -586,10 +615,10 @@ def main():
 
             mlflow.end_run()
 
-        logger.info("Skrypt (CNNOnly, alt) zakończył się sukcesem.")
+        logger.info("Script (CNNOnly, alt) finished successfully.")
 
     except Exception as e:
-        logger.exception("Błąd w trakcie działania skryptu (CNNOnly, alt).")
+        logger.exception("Error during script execution (CNNOnly, alt).")
         sys.exit(1)
 
 

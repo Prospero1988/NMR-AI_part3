@@ -2,31 +2,31 @@
 
 mlflow_tags1 = {
     "architecture": "Pytorch",
-    "model": "CNN 1D",
+    "model": "MLP",
     "stage": "Optuna HP",
     "author": "aleniak",
-    "opt trials": "0",
+    "opt trials": "2000",
     "property": "CHIlogD"
 }
 
 mlflow_tags2 = {
     "architecture": "Pytorch",
-    "predictor": "FP",
-    "model": "CNN",
+    "predictor": "1H",
+    "model": "MLP",
     "stage": "evaluation",
     "author": "aleniak",
-    "opt trials": "0",
+    "opt trials": "2000",
     "evaluation": "10CV",
     "property": "CHIlogD"
 }
 
 mlflow_tags3 = {
     "architecture": "Pytorch",
-    "predictor": "FP",
-    "model": "CNN",
+    "predictor": "1H",
+    "model": "MLP",
     "stage": "training",
     "author": "aleniak",
-    "opt trials": "0",
+    "opt trials": "2000",
     "evaluation": "10CV",
     "property": "CHIlogD"
 }

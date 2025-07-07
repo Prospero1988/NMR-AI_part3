@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Skrypt (tylko MLP Dual) do regresji na danych NMR (¹H + ¹³C).
-W trakcie optymalizacji (Optuna) używa 3CV, finalnie 10CV. Logowanie w MLflow,
-lokalny katalog wyników, historia triali Optuny, ważność hiperparametrów,
-wykres błędu i wykres RMSE vs ID triala.
-Dodatkowo logujemy wszystkie komunikaty i błędy do pliku w katalogu wynikowym.
+MLP Dual-Stream regression script for NMR data (¹H + ¹³C).
+Uses 3-fold CV during Optuna optimization, and 10-fold CV for final evaluation.
+Logs to MLflow, saves local results, Optuna trial history, hyperparameter importance,
+error plots, and RMSE vs. trial ID plots.
+All messages and errors are logged to a file in the results directory.
 """
 
 import argparse
@@ -39,7 +39,7 @@ import optuna.visualization.matplotlib as optuna_viz
 from pathlib import Path
 
 # ---------------------------------------------------------------------------------
-# Tagi MLflow (opcjonalnie)
+# MLflow tags (optional)
 # ---------------------------------------------------------------------------------
 MLFLOW_TAGS = {
     "property": "CHI logD",
@@ -48,70 +48,88 @@ MLFLOW_TAGS = {
 }
 
 # =================================================================================
-# Dataset
+# Dataset & I/O
 # =================================================================================
-# --------------------------------------------------------------------------- #
-#  Dataset & I/O                                                              #
-# --------------------------------------------------------------------------- #
 class NMRDataset(Dataset):
-    def __init__(self, X, y): self.X, self.y = X, y
-    def __len__(self):        return self.X.size(0)
-    def __getitem__(self, i): return self.X[i], self.y[i]
+    """
+    Dataset for NMR data with shape (N, 2, 200).
+    """
+    def __init__(self, X, y):
+        self.X = X
+        self.y = y
 
-def load_nmr_data(p1h: str, p13c: str):
-    df_h, df_c = pd.read_csv(p1h), pd.read_csv(p13c)
-    # nazwy kolumn + zachowanie duplikatów
+    def __len__(self):
+        return self.X.size(0)
+
+    def __getitem__(self, i):
+        return self.X[i], self.y[i]
+
+def load_nmr_data(path_1h: str, path_13c: str):
+    """
+    Loads and merges ¹H and ¹³C data into a single tensor of shape (N, 2, 200).
+    Returns: mol_names (pd.Series), x_nmr (N,2,200), y (N,)
+    """
+    df_h = pd.read_csv(path_1h)
+    df_c = pd.read_csv(path_13c)
+    # Preserve duplicates using cumcount
     df_h["_dup"] = df_h.groupby("MOLECULE_NAME").cumcount()
     df_c["_dup"] = df_c.groupby("MOLECULE_NAME").cumcount()
-    df_h.columns = ["MOLECULE_NAME","LABEL"]+[f"h_{i}" for i in range(df_h.shape[1]-3)]+["_dup"]
-    df_c.columns = ["MOLECULE_NAME","LABEL"]+[f"c_{i}" for i in range(df_c.shape[1]-3)]+["_dup"]
-    merged = pd.merge(df_h, df_c, on=["MOLECULE_NAME","LABEL","_dup"], how="inner")
+    df_h.columns = ["MOLECULE_NAME", "LABEL"] + [f"h_{i}" for i in range(df_h.shape[1] - 3)] + ["_dup"]
+    df_c.columns = ["MOLECULE_NAME", "LABEL"] + [f"c_{i}" for i in range(df_c.shape[1] - 3)] + ["_dup"]
+    merged = pd.merge(df_h, df_c, on=["MOLECULE_NAME", "LABEL", "_dup"], how="inner")
     h_cols = [c for c in merged.columns if c.startswith("h_")]
     c_cols = [c for c in merged.columns if c.startswith("c_")]
     x_h = merged[h_cols].values.astype(np.float32)
     x_c = merged[c_cols].values.astype(np.float32)
-    x_nmr = np.stack([x_h, x_c], axis=1)        # (N,2,200)
+    x_nmr = np.stack([x_h, x_c], axis=1)  # (N,2,200)
     y = merged["LABEL"].values
-    mol_names = merged["MOLECULE_NAME"]        #  ← NEW
-    return mol_names, x_nmr, y  
+    mol_names = merged["MOLECULE_NAME"]
+    return mol_names, x_nmr, y
 
-# --------------------------------------------------------------------------- #
-#  Cross-Attention block                                                      #
-# --------------------------------------------------------------------------- #
+# =================================================================================
+# Cross-Attention block
+# =================================================================================
 class CrossAttentionBlock(nn.Module):
+    """
+    Multihead cross-attention block for MLP streams.
+    """
     def __init__(self, dim: int, num_heads: int = 4):
         super().__init__()
-        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads,
-                                          batch_first=True)
-    def forward(self, q, kv):                  # q,kv: (B,1,D)
-        out, _ = self.attn(q, kv, kv)          # (B,1,D)
-        return out.squeeze(1)                  # -> (B,D)
+        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, batch_first=True)
 
-# --------------------------------------------------------------------------- #
-#  MLP Dual-Stream (+ opcjonalne CA)                                          #
-# --------------------------------------------------------------------------- #
+    def forward(self, q, kv):
+        # q, kv: (B,1,D)
+        out, _ = self.attn(q, kv, kv)
+        return out.squeeze(1)  # -> (B,D)
+
+# =================================================================================
+# MLP Dual-Stream (+ optional Cross-Attention)
+# =================================================================================
 class MLPDual(nn.Module):
+    """
+    Dual-stream MLP for NMR data (¹H and ¹³C) with optional cross-attention.
+    """
     def __init__(self, trial: optuna.Trial):
         super().__init__()
         act = nn.SiLU()
-        # arch-hp
         num_layers = trial.suggest_int("mlp_num_layers", 1, 6)
-        dropout     = trial.suggest_float("mlp_dropout", 0.0, 0.6, step=0.1)
+        dropout = trial.suggest_float("mlp_dropout", 0.0, 0.6, step=0.1)
         embed_dim = trial.suggest_int("embed_dim", 16, 512, log=True)
         self.use_ca = trial.suggest_categorical("use_cross_attention", [True, False])
-        num_heads  = trial.suggest_categorical("ca_heads", [1, 2, 4, 8])  # sugerowane bezpieczne wartości
+        num_heads = trial.suggest_categorical("ca_heads", [1, 2, 4, 8])
 
-        # DODAJ TEN BLOK:
+        # Ensure embed_dim is divisible by num_heads if using cross-attention
         if self.use_ca and embed_dim % num_heads != 0:
             embed_dim = math.ceil(embed_dim / num_heads) * num_heads
 
-        def make_stream(prefix:str):
-            in_dim = 200; layers=[]
+        def make_stream(prefix: str):
+            in_dim = 200
+            layers = []
             for i in range(num_layers):
                 out_dim = trial.suggest_int(f"{prefix}_h_l{i}", 32, 1024, log=True)
-                layers += [nn.Linear(in_dim,out_dim), act, nn.Dropout(dropout)]
+                layers += [nn.Linear(in_dim, out_dim), act, nn.Dropout(dropout)]
                 in_dim = out_dim
-            layers += [nn.Linear(in_dim, embed_dim), act]      # embed proj
+            layers += [nn.Linear(in_dim, embed_dim), act]
             return nn.Sequential(*layers)
 
         self.stream_h = make_stream("h")
@@ -121,36 +139,46 @@ class MLPDual(nn.Module):
             self.ca_h_on_c = CrossAttentionBlock(embed_dim, num_heads)
             self.ca_c_on_h = CrossAttentionBlock(embed_dim, num_heads)
 
-        final_dim   = trial.suggest_int("final_hidden_dim", 32, 512, log=True)
-        final_drop  = trial.suggest_float("final_dropout", 0.0, 0.6, step=0.1)
+        final_dim = trial.suggest_int("final_hidden_dim", 32, 512, log=True)
+        final_drop = trial.suggest_float("final_dropout", 0.0, 0.6, step=0.1)
         self.head = nn.Sequential(
-            nn.Linear(embed_dim*2, final_dim), act,
+            nn.Linear(embed_dim * 2, final_dim), act,
             nn.Dropout(final_drop),
             nn.Linear(final_dim, 1)
         )
 
-    def forward(self, x):                      # x: (B,2,200)
-        h = self.stream_h(x[:,0,:])            # (B,D)
-        c = self.stream_c(x[:,1,:])            # (B,D)
+    def forward(self, x):
+        # x: (B,2,200)
+        h = self.stream_h(x[:, 0, :])  # (B,D)
+        c = self.stream_c(x[:, 1, :])  # (B,D)
         if self.use_ca:
-            h = self.ca_h_on_c(h.unsqueeze(1), c.unsqueeze(1)) # (B,D)
-            c = self.ca_c_on_h(c.unsqueeze(1), h.unsqueeze(1)) # (B,D)
-        merged = torch.cat([h,c], dim=1)
+            h = self.ca_h_on_c(h.unsqueeze(1), c.unsqueeze(1))  # (B,D)
+            c = self.ca_c_on_h(c.unsqueeze(1), h.unsqueeze(1))  # (B,D)
+        merged = torch.cat([h, c], dim=1)
         return self.head(merged).squeeze(1)
 
 # =================================================================================
-# Pomocnicze funkcje
+# Utility functions
 # =================================================================================
 def set_seed(seed=1988):
+    """
+    Set random seed for reproducibility.
+    """
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
 def get_device():
+    """
+    Get available device (CUDA or CPU).
+    """
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def train_one_epoch(model, loader, optimizer, loss_fn, device):
+    """
+    Train the model for one epoch.
+    """
     model.train()
     running_loss = 0.0
     for x_nmr, y in loader:
@@ -166,6 +194,9 @@ def train_one_epoch(model, loader, optimizer, loss_fn, device):
     return running_loss / len(loader.dataset)
 
 def validate(model, loader, loss_fn, device):
+    """
+    Validate the model.
+    """
     model.eval()
     y_true = []
     y_pred = []
@@ -188,9 +219,12 @@ def validate(model, loader, loss_fn, device):
     return val_loss / len(loader.dataset), rmse, y_true, y_pred
 
 # =================================================================================
-# 10CV
+# 10-fold Cross-Validation
 # =================================================================================
 def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epochs=50):
+    """
+    Perform n-fold cross-validation and return metrics and predictions.
+    """
     kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
     indices = np.arange(len(dataset))
 
@@ -265,6 +299,10 @@ def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epoch
 # Objective (3CV) - MLPDual
 # =================================================================================
 def objective(trial, dataset, device):
+    """
+    Objective function for Optuna hyperparameter optimization using 3-fold cross-validation.
+    Returns the average RMSE across folds.
+    """
     batch_size = trial.suggest_int("batch_size", 16, 256, log=True)
     max_epochs = 50
 
@@ -309,13 +347,12 @@ def objective(trial, dataset, device):
     return avg_rmse
 
 # =================================================================================
-# main()
-# =================================================================================
-
-# =================================================================================
-# Override: create_model_and_optimizer for MLPDual
+# Model and optimizer factory for MLPDual
 # =================================================================================
 def create_model_and_optimizer(trial):
+    """
+    Create an MLPDual model and optimizer based on Optuna trial parameters.
+    """
     model = MLPDual(trial)
     optimizer_name = trial.suggest_categorical("optimizer", ["Adam", "SGD", "RMSProp"])
     lr = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
@@ -327,7 +364,9 @@ def create_model_and_optimizer(trial):
         optimizer = optim.RMSprop(model.parameters(), lr=lr)
     return model, optimizer
 
-
+# =================================================================================
+# Main
+# =================================================================================
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--path_1h", required=True)
@@ -341,7 +380,7 @@ def main():
     device = get_device()
 
     # ------------------------------------------------------------------------------
-    # Katalog wyników i logger
+    # Results directory and logger
     # ------------------------------------------------------------------------------
     filename_1h = os.path.basename(args.path_1h)
     prefix = filename_1h.split("_")[0]
@@ -350,7 +389,6 @@ def main():
 
     print(f"Starting experiment {prefix}")
 
-    # Logger do pliku + stdout
     log_file = os.path.join(res_dir, "script_mlpdual.log")
     logging.basicConfig(
         level=logging.INFO,
@@ -361,40 +399,40 @@ def main():
         ]
     )
     logger = logging.getLogger(__name__)
-    logger.info("Start skryptu (MLPDual). Katalog wynikowy: %s", res_dir)
+    logger.info("Script started (MLPDual). Results directory: %s", res_dir)
 
     try:
-        logger.info("Uruchomienie na urządzeniu: %s", device)
+        logger.info("Running on device: %s", device)
         mol_names, X_nmr, y = load_nmr_data(args.path_1h, args.path_13c)
         X_nmr_t = torch.from_numpy(X_nmr).float()
-        y_t     = torch.from_numpy(y).float()
+        y_t = torch.from_numpy(y).float()
 
         dataset = NMRDataset(X_nmr_t, y_t)
 
         mlflow.set_experiment(args.experiment_name)
         study = optuna.create_study(direction="minimize")
-        logger.info("Rozpoczynam study.optimize (n_trials=%d)", args.n_trials)
+        logger.info("Starting study.optimize (n_trials=%d)", args.n_trials)
         study.optimize(lambda tr: objective(tr, dataset, device), n_trials=args.n_trials)
 
         best_params = study.best_params
         best_value = study.best_value
-        logger.info("Optuna zakończona. Najlepsze parametry: %s, RMSE=%f", best_params, best_value)
+        logger.info("Optuna finished. Best parameters: %s, RMSE=%f", best_params, best_value)
 
         with mlflow.start_run(run_name="MLPDual_10CV") as run:
             run_tags = dict(MLFLOW_TAGS)
-            run_tags["file"] = prefix 
+            run_tags["file"] = prefix
             mlflow.set_tags(run_tags)
             mlflow.log_params(best_params)
             mlflow.log_param("n_trials", args.n_trials)
             mlflow.log_param("epochs_10cv", args.epochs_10cv)
 
-            # (1) Historia triali
+            # (1) Trials history
             df_trials = study.trials_dataframe(attrs=("number", "value", "params", "state"))
             csv_optuna = os.path.join(res_dir, "optuna_trials_mlpdual.csv")
             df_trials.to_csv(csv_optuna, index=False)
             mlflow.log_artifact(csv_optuna)
 
-            # Wykres RMSE vs. Trial ID
+            # RMSE vs Trial ID plot
             plot_trials_path = os.path.join(res_dir, "optuna_trials_rmse_mlpdual.png")
             fig = plt.figure()
             plt.plot(df_trials["number"], df_trials["value"], marker="o", linestyle="-")
@@ -406,14 +444,13 @@ def main():
             mlflow.log_artifact(plot_trials_path)
             plt.close(fig)
 
-            # (2) Ważność hiperparametrów
+            # (2) Hyperparameter importance
             param_importances = get_param_importances(study)
             json_path = os.path.join(res_dir, "param_importances_mlpdual.json")
             with open(json_path, "w") as f:
                 json.dump(param_importances, f, indent=2)
             mlflow.log_artifact(json_path)
 
-            # Poprawka: tutaj 'fig_imp' to Axes, więc pobieramy figure:
             fig_imp = optuna_viz.plot_param_importances(study)
             fig_real = fig_imp.figure
             fig_imp_path = os.path.join(res_dir, "param_importances.png")
@@ -443,7 +480,7 @@ def main():
                     opt = optim.RMSprop(model.parameters(), lr=lr)
                 return model, opt
 
-            logger.info("Rozpoczynam 10CV z parametrami: %s", best_params)
+            logger.info("Starting 10CV with parameters: %s", best_params)
             results = cross_validate(
                 model_func=best_model_func,
                 dataset=dataset,
@@ -464,10 +501,9 @@ def main():
 
             y_true_all = results["y_true_all"]
             y_pred_all = results["y_pred_all"]
-            logger.info("10CV zakończone. RMSE=%.4f±%.4f, MAE=%.4f±%.4f",
+            logger.info("10CV finished. RMSE=%.4f±%.4f, MAE=%.4f±%.4f",
                         rmse_mean, rmse_std, mae_mean, mae_std)
 
-            # <-- TU DODAŁEMY LOGOWANIE PARAMETRÓW DO MLflow
             mlflow.log_metric("rmse_mean_10cv", rmse_mean)
             mlflow.log_metric("rmse_std_10cv", rmse_std)
             mlflow.log_metric("mae_mean_10cv", mae_mean)
@@ -477,7 +513,7 @@ def main():
             mlflow.log_metric("pearson_mean_10cv", pearson_mean)
             mlflow.log_metric("pearson_std_10cv", pearson_std)
 
-            # Zapis metrics
+            # Save metrics
             metrics_path = os.path.join(res_dir, "metrics_mlpdual.csv")
             with open(metrics_path, "w") as f:
                 f.write("metric,mean,std\n")
@@ -487,7 +523,7 @@ def main():
                 f.write(f"pearson,{pearson_mean},{pearson_std}\n")
             mlflow.log_artifact(metrics_path)
 
-            # hyperparams
+            # Save hyperparameters
             hyperparams_path = os.path.join(res_dir, "hyperparams_mlpdual.csv")
             with open(hyperparams_path, "w") as f:
                 f.write("param,value\n")
@@ -495,7 +531,7 @@ def main():
                     f.write(f"{k},{v}\n")
             mlflow.log_artifact(hyperparams_path)
 
-            # csv z predykcjami
+            # Save predictions
             fold_indices_all = results["fold_indices_all"]
             df_cv = pd.DataFrame({
                 "fold": fold_indices_all,
@@ -506,30 +542,30 @@ def main():
             df_cv.to_csv(cv_csv_path, index=False)
             mlflow.log_artifact(cv_csv_path)
 
-            # Wykres y_true vs y_pred
+            # Plot y_true vs y_pred
             plot_path = os.path.join(res_dir, "real_vs_pred_plot_mlpdual.png")
-            plt.figure(figsize=(6,6))
+            plt.figure(figsize=(6, 6))
             plt.scatter(y_true_all, y_pred_all, alpha=0.5)
-            plt.xlabel("Rzeczywiste y")
-            plt.ylabel("Przewidywane y")
+            plt.xlabel("True y")
+            plt.ylabel("Predicted y")
             plt.title("MLPDual: Real vs. Pred (10CV)")
             plt.savefig(plot_path, dpi=300, bbox_inches="tight")
             mlflow.log_artifact(plot_path)
             plt.close()
 
-            # Wykres błędu: X=y_true, Y=|y_true - y_pred|
+            # Plot absolute error
             error_plot = os.path.join(res_dir, "error_plot_mlpdual.png")
-            plt.figure(figsize=(6,6))
+            plt.figure(figsize=(6, 6))
             abs_error = np.abs(y_true_all - y_pred_all)
             plt.scatter(y_true_all, abs_error, alpha=0.5)
-            plt.xlabel("Rzeczywiste y")
+            plt.xlabel("True y")
             plt.ylabel("|y_true - y_pred|")
-            plt.title("Błąd bezwzględny vs. y_true (10CV) - MLPDual")
+            plt.title("Absolute error vs. y_true (10CV) - MLPDual")
             plt.savefig(error_plot, dpi=300, bbox_inches="tight")
             mlflow.log_artifact(error_plot)
             plt.close()
 
-            # (4) Trening finalny modelu na całym zbiorze
+            # (4) Final model training on the whole dataset
             final_model, final_optimizer = best_model_func()
             final_model.to(device)
             loss_fn = nn.MSELoss()
@@ -551,30 +587,30 @@ def main():
 
             mlflow.pytorch.log_model(final_model, artifact_path="model_mlpdual")
 
-            # ---------------- Williams plot CSV-y ----------------
+            # ---------------- Williams plot CSVs ----------------
             final_model.eval()
             with torch.no_grad():
                 y_pred = final_model(X_nmr_t.to(device)).cpu().numpy()
 
             residuals = y - y_pred
             std_resid = (residuals - residuals.mean()) / residuals.std()
-            out_thr   = 3
+            out_thr = 3
 
-            X_feat = X_nmr.reshape(X_nmr.shape[0], -1)        # (N,400)
+            X_feat = X_nmr.reshape(X_nmr.shape[0], -1)  # (N,400)
             nz_mask = X_feat.std(0) > 1e-10
-            X_std   = (X_feat[:, nz_mask] - X_feat[:, nz_mask].mean(0)) / X_feat[:, nz_mask].std(0)
+            X_std = (X_feat[:, nz_mask] - X_feat[:, nz_mask].mean(0)) / X_feat[:, nz_mask].std(0)
 
-            H        = X_std @ np.linalg.pinv(X_std.T @ X_std) @ X_std.T
+            H = X_std @ np.linalg.pinv(X_std.T @ X_std) @ X_std.T
             leverage = np.diag(H)
-            lev_thr  = 3 * X_std.shape[1] / X_std.shape[0]
+            lev_thr = 3 * X_std.shape[1] / X_std.shape[0]
 
             williams_df = pd.DataFrame({
                 "MOLECULE_NAME": mol_names,
-                "y_true"       : y,
-                "y_pred"       : y_pred,
-                "residual"     : residuals,
-                "std_residual" : std_resid,
-                "leverage"     : leverage
+                "y_true": y,
+                "y_pred": y_pred,
+                "residual": residuals,
+                "std_residual": std_resid,
+                "leverage": leverage
             })
 
             full_csv = os.path.join(res_dir, f"{prefix}_williams_full.csv")
@@ -585,17 +621,15 @@ def main():
             out_csv = os.path.join(res_dir, f"{prefix}_williams_outliers.csv")
             outliers_df.to_csv(out_csv, index=False)
             mlflow.log_artifact(out_csv)
-            # -----------------------------------------------------
 
             mlflow.end_run()
 
-        logger.info("Skrypt (MLPDual) zakończył się sukcesem.")
+        logger.info("Script (MLPDual) finished successfully.")
 
     except Exception as e:
         logger = logging.getLogger(__name__)
-        logger.exception("Błąd w trakcie działania skryptu (MLPDual).")
+        logger.exception("Error during script execution (MLPDual).")
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
