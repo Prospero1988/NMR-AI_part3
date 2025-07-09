@@ -257,6 +257,10 @@ def process_file(csv_file, input_directory):
             for key in fold_metrics_list[0]:
                 avg_metrics[key] = np.mean([m[key] for m in fold_metrics_list])
 
+            # Add overall metrics
+            avg_metrics['Q2'] = avg_metrics.pop('R2')
+            mlflow.log_metric("Q2", avg_metrics['Q2'])
+
             # Combine per-instance data
             per_instance_data = pd.concat(per_instance_data_list, ignore_index=True)
 
@@ -305,13 +309,13 @@ def process_file(csv_file, input_directory):
 
             logger.info(
                 f"Average Metrics for {csv_file}: RMSE: {avg_metrics['RMSE']:.4f}, "
-                f"R2: {avg_metrics['R2']:.4f}, Pearson: {avg_metrics['Pearson']:.4f}, "
+                f"Q2: {avg_metrics['Q2']:.4f}, Pearson: {avg_metrics['Pearson']:.4f}, "
                 f"MAE: {avg_metrics['MAE']:.4f}, MAE StDev: {avg_metrics['MAE StDev']:.4f}"
             )
 
             logger.info(
                 f"Final Model Metrics for {csv_file}: RMSE: {final_metrics['RMSE']:.4f}, "
-                f"R2: {final_metrics['R2']:.4f}, Pearson: {final_metrics['Pearson']:.4f}, "
+                f"R2_train: {final_metrics['R2']:.4f}, Pearson: {final_metrics['Pearson']:.4f}, "
                 f"MAE: {final_metrics['MAE']:.4f}, MAE StDev: {final_metrics['MAE StDev']:.4f}"
             )
 

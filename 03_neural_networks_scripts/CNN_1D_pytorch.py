@@ -781,14 +781,14 @@ def train_final_model(csv_path, trial_params, csv_name):
         else:
             raise ValueError(f"Unknown optimizer: {optimizer_name}")
 
-        # Scheduler
+        # Scheduler for learning rate reduction on plateau
         if use_scheduler:
             scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5)
 
-        # Early stopping
+        # Early stopping to prevent overfitting
         early_stopping = EarlyStopping(patience=early_stop_patience, verbose=False)
 
-        # Training
+        # Training loop
         dataset = torch.utils.data.TensorDataset(torch.tensor(X_full, dtype=torch.float32),
                                                  torch.tensor(y_full, dtype=torch.float32))
         loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
@@ -807,7 +807,7 @@ def train_final_model(csv_path, trial_params, csv_name):
                 else:
                     continue  # Skip if batch_size == 1
 
-                # Add regularization
+                # Add regularization if specified
                 if model.regularization == 'l1':
                     l1_norm = sum(p.abs().sum() for p in model.parameters())
                     loss = loss + model.reg_rate * l1_norm
@@ -816,7 +816,7 @@ def train_final_model(csv_path, trial_params, csv_name):
                     loss = loss + model.reg_rate * l2_norm
                 loss.backward()
 
-                # Gradient clipping
+                # Clip gradients to avoid exploding gradients
                 torch.nn.utils.clip_grad_value_(model.parameters(), clip_grad_value)
 
                 optimizer.step()

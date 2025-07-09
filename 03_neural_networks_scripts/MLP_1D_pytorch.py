@@ -869,26 +869,26 @@ if __name__ == '__main__':
                 importance_fig_file = f"{csv_name}_param_importance.png"
                 importance_fig.savefig(importance_fig_file)
 
-                # Logowanie pliku z wykresem do MLflow
+                # Log the plot file to MLflow
                 mlflow.log_artifact(importance_fig_file)
 
-                # Zamknięcie figury, aby zwolnić zasoby
+                # Close the figure to free resources
                 plt.close(importance_fig)
 
-                # Pobranie ważności hiperparametrów
+                # Get hyperparameter importances
                 param_importances = importance.get_param_importances(study)
 
-                # Zapisanie ważności hiperparametrów do pliku JSON
+                # Save hyperparameter importances to a JSON file
                 param_importances_file = f"{csv_name}_param_importance.json"
                 with open(param_importances_file, 'w') as f:
                     json.dump(param_importances, f, indent=4)
 
-                # Logowanie pliku JSON do MLflow
+                # Log the JSON file to MLflow
                 mlflow.log_artifact(param_importances_file)
 
-                # Logowanie dodatkowych metryk z najlepszego trialu
+                # Log additional metrics from the best trial
                 mlflow.log_metric("RMSE", trial.user_attrs.get('rmse', None))
-                # Dodatkowe metryki mogą być logowane w funkcji evaluate_model_with_cv
+                # Additional metrics can be logged in the evaluate_model_with_cv function
 
                 print(f"Best trial for {csv_file}:")
                 print(f"  Value (RMSE): {trial.value}")
@@ -896,20 +896,20 @@ if __name__ == '__main__':
                 for key, value in trial.params.items():
                     print(f"    {key}: {value}")
 
-            # Rozpoczęcie nowego runu MLflow dla oceny modelu z walidacją krzyżową
+            # Start a new MLflow run for model evaluation with cross-validation
             with mlflow.start_run(
                 run_name=f"Evaluation_{csv_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
                 tags=tags_config_MLP_1D.mlflow_tags2
             ) as evaluation_run:
-                # Ocena modelu z użyciem 10-krotnej walidacji krzyżowej
+                # Evaluate the model using 10-fold cross-validation
                 evaluate_model_with_cv(csv_path, trial, csv_name)
 
-            # Rozpoczęcie nowego runu MLflow dla treningu finalnego modelu
+            # Start a new MLflow run for final model training
             with mlflow.start_run(
                 run_name=f"Training_{csv_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
                 tags=tags_config_MLP_1D.mlflow_tags3
             ) as training_run:
-                # Trenowanie finalnego modelu
+                # Train the final model
                 train_final_model(csv_path, trial, csv_name)
 
         except Exception as e:

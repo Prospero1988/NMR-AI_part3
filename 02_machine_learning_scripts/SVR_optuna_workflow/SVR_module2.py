@@ -13,7 +13,7 @@ import json
 import subprocess
 from logging.handlers import RotatingFileHandler
 from sklearn.svm import SVR
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.metrics import root_mean_squared_error, mean_absolute_error, r2_score
 from scipy.stats import pearsonr
 from mlflow.models.signature import infer_signature
 import warnings
@@ -179,7 +179,7 @@ def evaluate_model(model, X, y):
     })
 
     # Overall metrics
-    rmse = mean_squared_error(y, y_pred, squared=False)
+    rmse = root_mean_squared_error(y, y_pred)
     mae = mean_absolute_error(y, y_pred)
     mae_std = np.std(abs_error)
     r2 = r2_score(y, y_pred)
@@ -323,6 +323,10 @@ def process_file(csv_file, input_directory):
             for key in fold_metrics_list[0]:
                 avg_metrics[key] = np.mean([m[key] for m in fold_metrics_list])
 
+            # Add overall metrics
+            avg_metrics['Q2'] = avg_metrics.pop('R2')
+            mlflow.log_metric("Q2", avg_metrics['Q2'])
+
             # Combine per-instance data
             per_instance_data = pd.concat(per_instance_data_list, ignore_index=True)
 
@@ -378,13 +382,13 @@ def process_file(csv_file, input_directory):
 
             logger.info(
                 f"Average Metrics for {csv_file}: RMSE: {avg_metrics['RMSE']:.4f}, "
-                f"R2: {avg_metrics['R2']:.4f}, Pearson: {avg_metrics['Pearson']:.4f}, "
+                f"Q2: {avg_metrics['Q2']:.4f}, Pearson: {avg_metrics['Pearson']:.4f}, "
                 f"MAE: {avg_metrics['MAE']:.4f}, MAE StDev: {avg_metrics['MAE StDev']:.4f}"
             )
 
             logger.info(
                 f"Final Model Metrics for {csv_file}: RMSE: {final_metrics['RMSE']:.4f}, "
-                f"R2: {final_metrics['R2']:.4f}, Pearson: {final_metrics['Pearson']:.4f}, "
+                f"R2_train: {final_metrics['R2']:.4f}, Pearson: {final_metrics['Pearson']:.4f}, "
                 f"MAE: {final_metrics['MAE']:.4f}, MAE StDev: {final_metrics['MAE StDev']:.4f}"
             )
 
