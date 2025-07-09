@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from sklearn.model_selection import KFold, train_test_split
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, mean_absolute_error
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from scipy.stats import pearsonr
 import optuna
 import mlflow
@@ -663,13 +663,13 @@ def evaluate_model_with_cv(csv_path, trial_params, csv_name):
         # Calculate metrics
         final_rmse = np.mean(rmse_scores)
         final_mae = np.mean(mae_scores)
-        final_r2 = np.mean(r2_scores)
+        q2 = np.mean(r2_scores)
         final_pearson = np.mean(pearson_scores)
 
         # Log metrics
         mlflow.log_metric("RMSE", final_rmse)
         mlflow.log_metric("MAE", final_mae)
-        mlflow.log_metric("R2", final_r2)
+        mlflow.log_metric("Q2", q2)
         mlflow.log_metric("Pearson Correlation", final_pearson)
 
         # Save metrics to file
@@ -680,7 +680,7 @@ def evaluate_model_with_cv(csv_path, trial_params, csv_name):
         summary += f"\n10CV Metrics:\n"
         summary += f"10CV RMSE: {final_rmse}\n"
         summary += f"10CV MAE: {final_mae}\n"
-        summary += f"10CV R2: {final_r2}\n"
+        summary += f"10CV Q2: {q2}\n"
         summary += f"10CV Pearson Correlation: {final_pearson}\n"
 
         summary_file_name = f"{csv_name}_summary.txt"
@@ -692,7 +692,7 @@ def evaluate_model_with_cv(csv_path, trial_params, csv_name):
         print(f"\nValidation set evaluation for {csv_name}:")
         print(f"  10CV RMSE: {final_rmse}")
         print(f"  10CV MAE: {final_mae}")
-        print(f"  10CV R2: {final_r2}")
+        print(f"  10CV Q2: {q2}")
         print(f"  10CV Pearson Correlation: {final_pearson}")
 
         # Generate plot
@@ -829,6 +829,22 @@ def train_final_model(csv_path, trial_params, csv_name):
             if early_stopping.early_stop:
                 print(f'Final model: Early stopping triggered at epoch {epoch+1}')
                 break
+
+        model.eval()
+        with torch.no_grad():
+            y_train_pred = model(
+                torch.tensor(X_full, dtype=torch.float32).to(device)
+            ).squeeze().cpu().numpy()
+
+        r2_train = r2_score(y_full, y_train_pred)
+        mlflow.log_metric("R2_train", r2_train)
+        print(f"R2 on training set: {r2_train:.4f}")
+
+        summary_file_name = f"{csv_name}_summary.txt" 
+        with open(summary_file_name, "a") as f:         
+            f.write(f"R2_train: {r2_train}\n")
+
+        mlflow.log_artifact(summary_file_name)  
 
         # Save final model
         model_file_name = f"{csv_name}_final_model.pth"

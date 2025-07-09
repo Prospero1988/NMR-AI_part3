@@ -626,13 +626,13 @@ def evaluate_model_with_cv(csv_path, trial, csv_name):
         # Obliczenie średnich metryk z K-fold cross-validation
         final_rmse = np.mean(rmse_scores)
         final_mae = np.mean(mae_scores)
-        final_r2 = np.mean(r2_scores)
+        q2 = np.mean(r2_scores)
         final_pearson = np.mean(pearson_scores)
 
         # Logowanie metryk zbioru testowego
         mlflow.log_metric("RMSE", final_rmse)
         mlflow.log_metric("MAE", final_mae)
-        mlflow.log_metric("R2", final_r2)
+        mlflow.log_metric("Q2", q2)
         mlflow.log_metric("Pearson Correlation", final_pearson)
 
         # Zapisanie metryk i parametrów do pliku txt
@@ -646,7 +646,7 @@ def evaluate_model_with_cv(csv_path, trial, csv_name):
         summary += f"\n10CV Metrics:\n"
         summary += f"10CV RMSE: {final_rmse}\n"
         summary += f"10CV MAE: {final_mae}\n"
-        summary += f"10CV R2: {final_r2}\n"
+        summary += f"10CV Q2: {q2}\n"
         summary += f"10CV Pearson Correlation: {final_pearson}\n"
 
         summary_file_name = f"{csv_name}_summary.txt"
@@ -658,7 +658,7 @@ def evaluate_model_with_cv(csv_path, trial, csv_name):
         print(f"\nEvaluation on the validation set for {csv_file}:")
         print(f"  10CV RMSE: {final_rmse}")
         print(f"  10CV MAE: {final_mae}")
-        print(f"  10CV R2: {final_r2}")
+        print(f"  10CV Q2: {q2}")
         print(f"  10CV Pearson Correlation: {final_pearson}")
 
         # Generowanie wykresu dla wszystkich foldów
@@ -739,6 +739,22 @@ def train_final_model(csv_path, trial, csv_name):
                 loss = criterion(outputs, batch_y)
                 loss.backward()
                 optimizer.step()
+
+        model.eval()
+        with torch.no_grad():
+            y_train_pred = model(
+                torch.tensor(X_full, dtype=torch.float32).to(device)
+            ).squeeze().cpu().numpy()
+
+        r2_train = r2_score(y_full, y_train_pred)
+        mlflow.log_metric("R2_train", r2_train)
+        print(f"R2 on training set: {r2_train:.4f}")
+
+        summary_file_name = f"{csv_name}_summary.txt" 
+        with open(summary_file_name, "a") as f:         
+            f.write(f"R2_train: {r2_train}\n")
+
+        mlflow.log_artifact(summary_file_name)  
 
         # Zapisanie modelu
         model_file_name = f"{csv_name}_final_model.pth"
