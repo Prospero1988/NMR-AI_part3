@@ -32,7 +32,7 @@ NMR-AI_part3/
 ├── 04_hybrid_neural_networks_scripts/
 ├── 05_conda_environments/
 ├── 06_utility_scripts/
-├── 07_williams_plots_data_calculations/
+├── 07_williams_plots/
 ```
 
 ---
@@ -181,7 +181,7 @@ These outputs are suitable for generating Williams plots to assess the reliabili
 - All scripts support **MLflow** for experiment tracking.
 - **Optuna** is used for hyperparameter optimization.
 - Optimization → 10CV evaluation → final training is fully automated.
-- Log artifacts include: metrics, predictions, model weights, hyperparameter plots, Williams plots (where applicable).
+- Log artifacts include: metrics, predictions, model weights, hyperparameter plots, Williams plots input files.
 
 To define your own tags, modify the corresponding `tags_config_*.py` files.
 
