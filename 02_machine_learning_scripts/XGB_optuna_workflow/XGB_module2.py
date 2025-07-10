@@ -192,109 +192,81 @@ def save_metrics_and_params(avg_metrics, params, file_name, logger, fold_metrics
 
 def process_file(csv_file, input_directory):
     """
-    Process a single CSV file: load data, train and evaluate model, log results.
-
-    Args:
-        csv_file (str): Name of the CSV file.
-        input_directory (str): Path to the input directory.
+    Trenuje model XGBoost z 10-CV, zapisuje Q2, R2_train i pliki Williamsa.
     """
     try:
         logger = setup_logging('Training', f'training_{csv_file}.log')
-        data = load_data(os.path.join(input_directory, csv_file))
-        y = data[:, 0]
-        X = data[:, 1:]
+        data   = load_data(os.path.join(input_directory, csv_file))
+        y      = data[:, 0]
+        X      = data[:, 1:]
 
-        # Read best hyperparameters
+        # ---------- load best hyperparameters --------------------
         best_params_file = f"best_params_{os.path.splitext(csv_file)[0]}.json"
-        with open(best_params_file, 'r') as f:
-            best_params = json.load(f)
+        with open(best_params_file, "r") as fp:
+            best_params = json.load(fp)
 
-        num_boost_round = best_params.pop('num_boost_round', 100)
-        # Adjust parameters for CPU training
-        best_params.pop('device', None)
-        best_params.pop('gpu_id', None)
-        best_params['tree_method'] = 'hist'  # Use CPU hist method
+        num_boost_round = best_params.pop("num_boost_round", 100)
+        best_params.pop("device", None)   # CPU
+        best_params.pop("gpu_id", None)
+        best_params["tree_method"] = "hist"
 
         run_name = f"Training_{csv_file}_{int(time.time())}"
         with mlflow.start_run(run_name=run_name):
-            
-            # Set tags from the external file
-            for tag_name, tag_value in XGB_tags_config.mlflow_tags2.items():
-                mlflow.set_tag(tag_name, tag_value)
-    
-            # Set up KFold cross-validation
+
+            for k, v in XGB_tags_config.mlflow_tags2.items():
+                mlflow.set_tag(k, v)
+
+            # ---------- 10-fold CV ------------------------------------------
             kf = KFold(n_splits=10, shuffle=True, random_state=42)
-            fold_metrics_list = []
-            per_instance_data_list = []
-            y_pred_all = np.zeros_like(y)
-            fold = 1
+            fold_metrics, y_pred_all = [], np.zeros_like(y)
 
-            for train_index, val_index in kf.split(X):
-                X_train, X_val = X[train_index], X[val_index]
-                y_train, y_val = y[train_index], y[val_index]
+            for fold, (train_idx, val_idx) in enumerate(kf.split(X), 1):
+                X_tr, X_val = X[train_idx], X[val_idx]
+                y_tr, y_val = y[train_idx], y[val_idx]
 
-                # Train the model on the training set
-                model, evals_result = train_final_model(X_train, y_train, best_params, num_boost_round)
+                model, _ = train_final_model(X_tr, y_tr, best_params, num_boost_round)
+                m, _, y_hat = evaluate_model(model, X_val, y_val)
 
-                # Evaluate the model on the validation set
-                metrics, per_instance_data, y_pred = evaluate_model(model, X_val, y_val)
+                y_pred_all[val_idx] = y_hat
+                fold_metrics.append(m)
 
-                # Update the overall predictions
-                y_pred_all[val_index] = y_pred
+                mlflow.log_metrics({f"Fold{fold}_{k}": v for k, v in m.items()})
 
-                # Append per-instance data
-                per_instance_data_list.append(per_instance_data)
+            # --- averages (Q2 is the average R2 of the folds) ------------------------
+            avg = {k: np.mean([fm[k] for fm in fold_metrics]) for k in fold_metrics[0]}
+            Q2  = avg.pop("R2")   
+            avg["Q2"] = Q2
+            mlflow.log_metric("Q2", Q2)
 
-                # Log per-fold metrics
-                logger.info(f"Fold {fold} metrics: {metrics}")
-                mlflow.log_metrics({f'Fold_{fold}_{k}': v for k, v in metrics.items()})
-                fold_metrics_list.append(metrics)
+            #CV plots
+            generate_and_log_plots(y, y_pred_all, csv_file, suffix="_cv")
 
-                fold += 1
+            # write fold metrics + averages
+            avg_metrics_file = f"{os.path.splitext(csv_file)[0]}_cv_metrics.json"
+            with open(avg_metrics_file, "w") as fp:
+                json.dump({"average": avg, "per_fold": fold_metrics}, fp, indent=2)
+            mlflow.log_artifact(avg_metrics_file)
 
-            # Compute average metrics over folds
-            avg_metrics = {}
-            for key in fold_metrics_list[0]:
-                avg_metrics[key] = np.mean([m[key] for m in fold_metrics_list])
+            # ---------- training on whole set -----------------------------
+            final_model, _ = train_final_model(X, y, best_params, num_boost_round)
+            fin_metrics, _, y_pred_final = evaluate_model(final_model, X, y)
 
-            # Add overall metrics
-            avg_metrics['Q2'] = avg_metrics.pop('R2')
-            mlflow.log_metric("Q2", avg_metrics['Q2'])
+            # R2_train = R2 of the final model on the training set
+            R2_train = fin_metrics["R2"]
+            mlflow.log_metric("R2_train", R2_train)
 
-            # Combine per-instance data
-            per_instance_data = pd.concat(per_instance_data_list, ignore_index=True)
+            generate_and_log_plots(y, y_pred_final, csv_file, suffix="_final")
 
-            # Generate and log plots for cross-validation predictions
-            generate_and_log_plots(y, y_pred_all, csv_file, suffix='_cv')
+            # ---------- Williams for the final model ------------------------
+            compute_and_log_williams(X, y, y_pred_final, csv_file)
 
-            # Log average metrics to MLflow
-            mlflow.log_metrics(avg_metrics)
+            # ---------- model & artifact recording ----------------------------
+            model_file = f"{os.path.splitext(csv_file)[0]}_final_model.pkl"
+            joblib.dump(final_model, model_file)
+            mlflow.log_artifact(model_file)
 
-            # Save per-instance data
-            per_instance_data_file = f"{os.path.splitext(csv_file)[0]}_per_instance_data.csv"
-            per_instance_data.to_csv(per_instance_data_file, index=False)
-            mlflow.log_artifact(per_instance_data_file)
-
-            # Train final model on the full dataset
-            final_model, evals_result = train_final_model(X, y, best_params, num_boost_round)
-
-            # Evaluate final model
-            final_metrics, final_per_instance_data, y_pred_final = evaluate_model(final_model, X, y)
-
-            # Generate and log plots for final model predictions
-            generate_and_log_plots(y, y_pred_final, csv_file, suffix='_final')
-
-            # Log final model metrics
-            mlflow.log_metrics({f'Final_{k}': v for k, v in final_metrics.items()})
-
-            # Save the final model trained on the full data
-            model_file_name = f"{os.path.splitext(csv_file)[0]}_trained_model.pkl"
-            joblib.dump(final_model, model_file_name)
-            mlflow.log_artifact(model_file_name)
-
-            # Save the model to MLflow
             input_example = pd.DataFrame(X[:5])
-            signature = infer_signature(input_example, y_pred_final[:5])
+            signature     = infer_signature(input_example, y_pred_final[:5])
             mlflow.xgboost.log_model(
                 final_model,
                 artifact_path="model",
@@ -302,28 +274,27 @@ def process_file(csv_file, input_directory):
                 input_example=input_example
             )
 
-            # Save metrics and parameters to file
-            metrics_file_name = f"{os.path.splitext(csv_file)[0]}_trained_metrics_and_params.txt"
-            save_metrics_and_params(avg_metrics, best_params, metrics_file_name, logger, fold_metrics_list, final_metrics)
-            mlflow.log_artifact(metrics_file_name)
+            # metrics txt
+            metrics_txt = f"{os.path.splitext(csv_file)[0]}_metrics_overview.txt"
+            save_metrics_and_params(avg, best_params, metrics_txt,
+                                    logger, fold_metrics, fin_metrics)
+            mlflow.log_artifact(metrics_txt)
 
             logger.info(
-                f"Average Metrics for {csv_file}: RMSE: {avg_metrics['RMSE']:.4f}, "
-                f"Q2: {avg_metrics['Q2']:.4f}, Pearson: {avg_metrics['Pearson']:.4f}, "
-                f"MAE: {avg_metrics['MAE']:.4f}, MAE StDev: {avg_metrics['MAE StDev']:.4f}"
+                f"Averaged RMSE: {avg['RMSE']:.4f}, Q2: {Q2:.4f}, "
+                f"Pearson: {avg['Pearson']:.4f}"
             )
-
             logger.info(
-                f"Final Model Metrics for {csv_file}: RMSE: {final_metrics['RMSE']:.4f}, "
-                f"R2_train: {final_metrics['R2']:.4f}, Pearson: {final_metrics['Pearson']:.4f}, "
-                f"MAE: {final_metrics['MAE']:.4f}, MAE StDev: {final_metrics['MAE StDev']:.4f}"
+                f"Final - RMSE: {fin_metrics['RMSE']:.4f}, "
+                f"R2_train: {R2_train:.4f}, Pearson: {fin_metrics['Pearson']:.4f}"
             )
 
         logger.info(f"Finished processing {csv_file}")
 
     except Exception as e:
         logging.error(f"Error processing {csv_file}: {e}", exc_info=True)
-        mlflow.log_param('Exception', str(e))
+        mlflow.log_param("Exception", str(e))
+    
 
 def main():
     """
@@ -379,6 +350,51 @@ def generate_and_log_plots(y_true, y_pred, csv_file, suffix=''):
     plt.savefig(residuals_plot)
     mlflow.log_artifact(residuals_plot)
     plt.close()
+
+# ---------- Williams plot (leverage & standardised residuals) ----------------
+def compute_and_log_williams(
+        X: np.ndarray,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        csv_file: str
+    ):
+    """
+    Saves two files:
+    • <name>_williams_full.csv - all samples
+    • <name>_williams_outliers.csv - only observations exceeding thresholds
+
+    We upload both files to MLflow as artifacts.
+    """
+    residuals   = y_true - y_pred
+    mse         = np.mean(residuals ** 2)
+    std_resid   = residuals / np.sqrt(mse)
+
+    X_centered  = X - X.mean(0, keepdims=True)
+    X_var_mask  = X_centered.std(0) > 1e-12
+    X_use       = X_centered[:, X_var_mask]
+    H           = X_use @ np.linalg.pinv(X_use.T @ X_use) @ X_use.T
+    leverage    = np.diag(H)
+
+    p, n        = X_use.shape[1], X_use.shape[0]
+    h_star      = 3 * (p + 1) / n         
+    out_mask    = (np.abs(std_resid) > 3) | (leverage > h_star)
+
+    base        = os.path.splitext(csv_file)[0]
+    full_path   = f"{base}_williams_full.csv"
+    out_path    = f"{base}_williams_outliers.csv"
+
+    full_df = pd.DataFrame({
+        "y_true"       : y_true,
+        "y_pred"       : y_pred,
+        "residual"     : residuals,
+        "std_residual" : std_resid,
+        "leverage"     : leverage,
+    })
+    full_df.to_csv(full_path, index=False)
+    full_df[out_mask].to_csv(out_path, index=False)
+
+    mlflow.log_artifact(full_path)
+    mlflow.log_artifact(out_path)
 
 
 if __name__ == "__main__":

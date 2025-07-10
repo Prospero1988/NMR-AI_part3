@@ -11,10 +11,10 @@ def main():
     then calls module1.py for Optuna optimization and module2.py for 10-fold CV evaluation.
     """
     parser = argparse.ArgumentParser(
-        description='Main script to run hyperparameter optimization and model training.'
+        description='Main script to run hyperparameter optimization and training'
     )
     parser.add_argument(
-        'input_directory',
+        '--csv_path',
         type=str,
         help='Path to the input directory containing CSV files'
     )
@@ -24,13 +24,22 @@ def main():
         default='Default',
         help='Name of the MLflow experiment'
     )
-    args = parser.parse_args()
 
-    input_directory = args.input_directory
+    parser.add_argument(
+        '--n_trials', 
+        type=int, 
+        required=False, 
+        default=1000, 
+        help='Number of trials for Optuna hyperparameter optimization')
+
+    args = parser.parse_args()
+    input_directory = args.csv_path
     experiment_name = args.experiment_name
+    n_trials = args.n_trials
+
 
     # Call module1.py for hyperparameter optimization with Optuna
-    subprocess.run(['python', 'SVR_module1.py', input_directory, '--experiment_name', experiment_name])
+    subprocess.run(['python', 'SVR_module1.py', input_directory, '--experiment_name', experiment_name, '--n_trials', str(n_trials)])
 
     # Call module2.py for 10-fold cross-validation evaluation
     subprocess.run(['python', 'SVR_module2.py', input_directory, '--experiment_name', experiment_name])

@@ -18,6 +18,31 @@ import XGB_tags_config
 import matplotlib.pyplot as plt
 import optuna.visualization.matplotlib as optuna_visualization
 
+
+# ---------- progress-bar for Optuna -----------------------------------------
+try:
+    from tqdm.auto import tqdm
+except ImportError:   # tqdm nie zainstalowany
+    tqdm = None
+
+class _TqdmProgress:
+    """
+    Minimal replacement for optuna.integration.progress.TqdmCallback.
+    Pokazuje pasek postępu w terminalu bez żadnych zewnętrznych wtyczek.
+    """
+    def __init__(self, total_trials: int):
+        self._total = total_trials
+        self._pbar  = tqdm(total=total_trials, desc="Optuna", ncols=80) if tqdm else None
+
+    def __call__(self, study: "optuna.Study", trial: "optuna.trial.FrozenTrial") -> None:
+        if self._pbar:
+            self._pbar.update()
+
+    def close(self):
+        if self._pbar:
+            self._pbar.close()
+
+
 def setup_logging(logger_name, log_file):
     """
     Initialize and configure logging to both file and console.
@@ -119,7 +144,7 @@ def log_environment():
         except Exception as e:
             logging.warning(f"Could not log pip requirements: {e}")
 
-def optimize_hyperparameters(X, y, logger, csv_file):
+def optimize_hyperparameters(X, y, logger, csv_file, n_trials=1000):
     """
     Optimize XGBoost hyperparameters using Optuna and log results to MLflow.
 
@@ -190,7 +215,18 @@ def optimize_hyperparameters(X, y, logger, csv_file):
 
     study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler())
     optuna.logging.set_verbosity(optuna.logging.WARNING)
-    study.optimize(objective, n_trials=1000, n_jobs=-1)
+    
+    pbar_cb = _TqdmProgress(n_trials)           
+
+    study.optimize(
+        objective,
+        n_trials=n_trials,
+        n_jobs=-1,
+        callbacks=[pbar_cb],                    
+    )
+
+    pbar_cb.close()                             
+
 
     best_trial = study.best_trial
     best_params = best_trial.params
@@ -207,7 +243,7 @@ def optimize_hyperparameters(X, y, logger, csv_file):
     mlflow.log_metric('num_boost_round', num_boost_round)
     return best_params, num_boost_round, study
 
-def process_file(csv_file, input_directory):
+def process_file(csv_file, input_directory, n_trials):
     """
     Process a single CSV file: load data, optimize hyperparameters, and log results.
 
@@ -229,7 +265,7 @@ def process_file(csv_file, input_directory):
                 mlflow.set_tag(tag_name, tag_value)
             
             log_environment()
-            best_params, num_boost_round, study = optimize_hyperparameters(X, y, logger, csv_file)
+            best_params, num_boost_round, study = optimize_hyperparameters(X, y, logger, csv_file, n_trials)
             best_params['num_boost_round'] = num_boost_round
 
             # Save best_params to JSON
@@ -259,6 +295,7 @@ def main():
     parser = argparse.ArgumentParser(description='Hyperparameter Optimization with XGBoost and Optuna')
     parser.add_argument('input_directory', type=str, help='Path to the input directory containing CSV files')
     parser.add_argument('--experiment_name', type=str, default='Default', help='Name of the MLflow experiment')
+    parser.add_argument('--n_trials', type=int, required=False, default=1000, help='Number of trials for Optuna hyperparameter optimization')
     args = parser.parse_args()
 
     input_directory = args.input_directory
@@ -267,7 +304,7 @@ def main():
 
     csv_files = check_input_directory(input_directory)
     for csv_file in csv_files:
-        process_file(csv_file, input_directory)
+        process_file(csv_file, input_directory, args.n_trials)
 
 if __name__ == "__main__":
     main()

@@ -13,7 +13,7 @@ import json
 import subprocess
 from logging.handlers import RotatingFileHandler
 from sklearn.svm import SVR
-from sklearn.metrics import root_mean_squared_error, mean_absolute_error, r2_score
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from scipy.stats import pearsonr
 from mlflow.models.signature import infer_signature
 import warnings
@@ -179,7 +179,7 @@ def evaluate_model(model, X, y):
     })
 
     # Overall metrics
-    rmse = root_mean_squared_error(y, y_pred)
+    rmse = mean_squared_error(y, y_pred, squared=False)
     mae = mean_absolute_error(y, y_pred)
     mae_std = np.std(abs_error)
     r2 = r2_score(y, y_pred)
@@ -318,10 +318,15 @@ def process_file(csv_file, input_directory):
 
                 fold += 1
 
-            # Compute average metrics over folds
+            # ---------- Averaged metrics from 10-CV ----------
             avg_metrics = {}
             for key in fold_metrics_list[0]:
                 avg_metrics[key] = np.mean([m[key] for m in fold_metrics_list])
+
+            # Q2 = averaged R2 over all folds
+            q2 = avg_metrics['R2']
+            mlflow.log_metric("Q2", q2)
+            avg_metrics['Q2'] = q2       
 
             # Add overall metrics
             avg_metrics['Q2'] = avg_metrics.pop('R2')
@@ -347,9 +352,16 @@ def process_file(csv_file, input_directory):
             # Evaluate final model
             final_metrics, final_per_instance_data = evaluate_model(final_model, X, y)
 
+            # ---------- metrics for the model trained on the entire dataset ----------
+            r2_train = final_metrics['R2']
+            mlflow.log_metric("R2_train", r2_train)
+
             # Generate and log plots for final model predictions
             y_pred_final = final_model.predict(X)
             generate_and_log_plots(y, y_pred_final, csv_file, suffix='_final')
+
+            # --------- Williams plot (finalny model) ----------
+            compute_and_log_williams(X, y, y_pred_final, csv_file)
 
             # Log final model metrics
             mlflow.log_metrics({f'Final_{k}': v for k, v in final_metrics.items()})
@@ -388,7 +400,7 @@ def process_file(csv_file, input_directory):
 
             logger.info(
                 f"Final Model Metrics for {csv_file}: RMSE: {final_metrics['RMSE']:.4f}, "
-                f"R2_train: {final_metrics['R2']:.4f}, Pearson: {final_metrics['Pearson']:.4f}, "
+                f"R2_train: {r2_train:.4f}, Pearson: {final_metrics['Pearson']:.4f}, "
                 f"MAE: {final_metrics['MAE']:.4f}, MAE StDev: {final_metrics['MAE StDev']:.4f}"
             )
 
@@ -451,6 +463,48 @@ def log_environment():
             mlflow.log_artifact(pip_req_file)
         except Exception as e:
             logging.warning(f"Could not log pip requirements: {e}")
+
+def compute_and_log_williams(X, y_true, y_pred, csv_file):
+    """
+    Saves two files:
+    • <name>_williams_full.csv
+    • <name>_williams_outliers.csv
+
+    and uploads them to MLflow.
+
+    """
+    residuals = y_true - y_pred
+    mse       = np.mean(residuals ** 2)
+    std_resid = residuals / np.sqrt(mse)
+
+    # design matrix (hat-matrix)
+    Xc     = X - X.mean(0, keepdims=True)
+    mask   = Xc.std(0) > 1e-12
+    X_use  = Xc[:, mask]
+    H      = X_use @ np.linalg.pinv(X_use.T @ X_use) @ X_use.T
+    leverage = np.diag(H)
+
+    p, n   = X_use.shape[1], X_use.shape[0]
+    h_star = 3 * (p + 1) / n
+
+    base    = os.path.splitext(csv_file)[0]
+    full_fn = f"{base}_williams_full.csv"
+    out_fn  = f"{base}_williams_outliers.csv"
+
+    full_df = pd.DataFrame({
+        "y_true"      : y_true,
+        "y_pred"      : y_pred,
+        "residual"    : residuals,
+        "std_residual": std_resid,
+        "leverage"    : leverage
+    })
+    full_df.to_csv(full_fn, index=False)
+    full_df[(np.abs(std_resid) > 3) | (leverage > h_star)].to_csv(out_fn,
+                                                                  index=False)
+
+    mlflow.log_artifact(full_fn)
+    mlflow.log_artifact(out_fn)
+
 
 def generate_and_log_plots(y_true, y_pred, csv_file, suffix=''):
     """

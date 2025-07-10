@@ -17,6 +17,22 @@ import SVR_tags_config
 import matplotlib.pyplot as plt
 import optuna.visualization.matplotlib as optuna_visualization
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
+
+class _TqdmProgress:
+    def __init__(self, total):
+        self._bar = tqdm(total=total, desc="Optuna", ncols=80) if tqdm else None
+    def __call__(self, study, trial):   # callback signature
+        if self._bar:
+            self._bar.update()
+    def __del__(self):
+        if self._bar:
+            self._bar.close()
+
+
 # Initialize basic logging
 logging.basicConfig(level=logging.INFO)
 
@@ -24,10 +40,12 @@ def main():
     parser = argparse.ArgumentParser(description='SVR Hyperparameter Optimization with MLflow and Optuna')
     parser.add_argument('input_directory', type=str, help='Path to the input directory containing CSV files')
     parser.add_argument('--experiment_name', type=str, default='Default', help='Name of the MLflow experiment')
+    parser.add_argument('--n_trials', type=int, required=False, default=1000, help='Number of trials for Optuna hyperparameter optimization')
     args = parser.parse_args()
 
     input_directory = args.input_directory
     experiment_name = args.experiment_name
+    n_trials = args.n_trials
 
     # Set the MLflow experiment
     mlflow.set_experiment(experiment_name)
@@ -35,7 +53,7 @@ def main():
     csv_files = check_input_directory(input_directory)
 
     for csv_file in csv_files:
-        process_file(csv_file, input_directory)
+        process_file(csv_file, input_directory, n_trials)
         # Ensure that each run is properly ended
         if mlflow.active_run():
             mlflow.end_run()
@@ -139,7 +157,7 @@ def log_environment():
         except Exception as e:
             logging.warning(f"Could not log pip requirements: {e}")
 
-def optimize_hyperparameters(X, y, logger, csv_file):
+def optimize_hyperparameters(X, y, logger, csv_file, n_trials):
     """
     Optimize SVR hyperparameters using Optuna and log results to MLflow.
 
@@ -224,7 +242,7 @@ def optimize_hyperparameters(X, y, logger, csv_file):
         optuna.logging.set_verbosity(optuna.logging.WARNING)  # Suppress Optuna logs
 
         # Set n_jobs=1 to avoid GPU conflicts
-        study.optimize(objective, n_trials=5000, n_jobs=1)
+        study.optimize(objective, n_trials=n_trials, n_jobs=1, callbacks=[_TqdmProgress(n_trials)])
 
         # After optimization, get GPU ID from the best trial
         best_trial_number = study.best_trial.number
@@ -260,7 +278,7 @@ def optimize_hyperparameters(X, y, logger, csv_file):
         logger.error(f"Error during optimization: {e}", exc_info=True)
         raise  # Re-raise the exception
 
-def process_file(csv_file, input_directory):
+def process_file(csv_file, input_directory, n_trials):
     try:
         data = load_data(os.path.join(input_directory, csv_file))
 
@@ -282,7 +300,7 @@ def process_file(csv_file, input_directory):
             logger.info(f"Starting optimization for {csv_file}")
 
             # Hyperparameter optimization
-            best_params, study = optimize_hyperparameters(X, y, logger, csv_file)
+            best_params, study = optimize_hyperparameters(X, y, logger, csv_file, n_trials)
             logger.info(f"Finished optimization for {csv_file}")
 
             fig = optuna_visualization.plot_param_importances(study)
