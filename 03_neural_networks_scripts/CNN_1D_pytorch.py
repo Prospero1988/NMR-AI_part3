@@ -2,7 +2,7 @@
 """
 Script for regression using 1D CNN with Optuna optimization and cross-validation.
 
-Created on Fri Oct  4 10:22:24 2024
+Created 07 2025
 
 @author: Arkadiusz Leniak
 """
@@ -27,6 +27,9 @@ import optuna.visualization.matplotlib as optuna_viz
 import matplotlib.pyplot as plt
 import json
 from optuna import importance
+
+import logging
+logging.getLogger("mlflow.utils.requirements_utils").setLevel(logging.ERROR)
 
 # Import MLflow tags from tags_config_pytorch_CNN_1D.py
 import tags_config_CNN_1D
@@ -836,15 +839,54 @@ def train_final_model(csv_path, trial_params, csv_name):
                 torch.tensor(X_full, dtype=torch.float32).to(device)
             ).squeeze().cpu().numpy()
 
-        r2_train = r2_score(y_full, y_train_pred)
-        mlflow.log_metric("R2_train", r2_train)
-        print(f"R2 on training set: {r2_train:.4f}")
+        # ---------- METRYKI na pełnym train-secie ----------
+        rmse_train = float(np.sqrt(mean_squared_error(y_full, y_train_pred)))
+        r2_train   = float(r2_score(y_full, y_train_pred))
+        mlflow.log_metric("rmse_train", rmse_train)
+        mlflow.log_metric("r2_train",   r2_train)
+        print(f"RMSE_train: {rmse_train:.4f} | R2_train: {r2_train:.4f}")
 
         summary_file_name = f"{csv_name}_summary.txt" 
         with open(summary_file_name, "a") as f:         
-            f.write(f"R2_train: {r2_train}\n")
+            f.write(f"RMSE_train: {rmse_train}\n")
+            f.write(f"R2_train:   {r2_train}\n")
 
-        mlflow.log_artifact(summary_file_name)  
+        # ---------- WILLIAMS-plot (FULL TRAIN SET) ----------
+        try:
+            # 1) leverage
+            X_feat = X_full.astype(np.float64)          # (N, p)
+            nz = X_feat.std(0) > 1e-12                 # usuń kolumny zerowej wariancji
+            X_std = (X_feat[:, nz] - X_feat[:, nz].mean(0)) / X_feat[:, nz].std(0)
+
+            H = X_std @ np.linalg.pinv(X_std.T @ X_std) @ X_std.T
+            leverage = np.diag(H)
+
+            # 2) standaryzowane residua
+            residuals  = y_full - y_train_pred
+            std_resid  = residuals / (rmse_train * np.sqrt(1.0 - leverage + 1e-12))
+
+            # 3) thresholdy
+            p, n = X_std.shape[1], X_std.shape[0]
+            h_star = 3.0 * (p + 1) / n
+
+            wdf = pd.DataFrame({
+                "y_true":        y_full,
+                "y_pred":        y_train_pred,
+                "residual":      residuals,
+                "std_residual":  std_resid,
+                "leverage":      leverage,
+            })
+
+            full_csv = f"{csv_name}_williams_full.csv"
+            out_csv  = f"{csv_name}_williams_outliers.csv"
+            wdf.to_csv(full_csv, index=False)
+            wdf[(np.abs(std_resid) > 3.0) | (leverage > h_star)].to_csv(out_csv, index=False)
+
+            mlflow.log_artifact(full_csv)
+            mlflow.log_artifact(out_csv)
+        except Exception as w_exc:
+            print(f"[WARN] Williams data not written: {w_exc}")
+        # -----------------------------------------------
 
         # Save final model
         model_file_name = f"{csv_name}_final_model.pth"
@@ -931,17 +973,27 @@ if __name__ == '__main__':
         print(f"\nProcessing file: {csv_file}")
 
         try:
-            # Run MLflow for hyperparameter optimization
+            # Start MLflow run for hyperparameter optimization
             with mlflow.start_run(
-                run_name=f"Optimization_{csv_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
-                tags=tags_config_CNN_1D.mlflow_tags1
+                    run_name=f"Optimization_{csv_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
+                    tags=tags_config_CNN_1D.mlflow_tags1
             ) as optuna_run:
-                # Wrapper for objective function
-                def objective_wrapper(trial):
-                    return objective(trial, csv_path)
 
-                study = optuna.create_study(direction='minimize')
-                study.optimize(objective_wrapper, n_trials=args.n_trials)
+                # --- Custom callback to print each finished trial result ---
+                def print_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial):
+                    # flush=True ensures lines are printed immediately
+                    print(f"[Trial {trial.number:>4}]  RMSE = {trial.value:.4f}", flush=True)
+
+                # Objective function for study.optimize
+                objective_wrapper = lambda tr: objective(tr, csv_path)
+
+                study = optuna.create_study(direction="minimize")
+                study.optimize(
+                    objective_wrapper,
+                    n_trials=args.n_trials,
+                    callbacks=[print_callback],
+                    show_progress_bar=True      # built-in tqdm progress bar
+                )
 
                 torch.cuda.empty_cache()
 

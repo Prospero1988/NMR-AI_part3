@@ -2,7 +2,7 @@
 """
 Simplified PyTorch script with extended optimization.
 
-Created on Fri Oct  4 10:22:24 2024
+Created 07 2025
 
 @author: Arkadiusz Leniak
 """
@@ -31,6 +31,9 @@ from sklearn.preprocessing import StandardScaler
 from optuna import importance
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+import logging
+logging.getLogger("mlflow.utils.requirements_utils").setLevel(logging.ERROR)
 
 # Import MLflow tags from tags_config_pytorch.py
 import tags_config_MLP_1D
@@ -690,7 +693,10 @@ def evaluate_model_with_cv(csv_path, trial, csv_name):
         raise e
 
 
-def train_final_model(csv_path, trial, csv_name):
+def train_final_model(csv_path: str,
+                      trial:      optuna.trial.FrozenTrial,
+                      csv_name:   str) -> None:
+
     """
     Train the final model on the entire dataset.
 
@@ -702,108 +708,86 @@ def train_final_model(csv_path, trial, csv_name):
     Raises:
         Exception: For any exceptions during training.
     """
-    try:
-        # Wczytanie danych
-        X_full, y_full = load_data(csv_path, target_column_name='LABEL')
+    X_full, y_full = load_data(csv_path, target_column_name="LABEL")
 
-        # Konwersja do tensora
-        X_full = X_full.astype(np.float32)
-        y_full = y_full.astype(np.float32)
+    X_full = X_full.astype(np.float32)
+    y_full = y_full.astype(np.float32)
 
-        # Tworzenie modelu z najlepszymi parametrami
-        input_dim = X_full.shape[1]
-        model = Net(trial, input_dim).to(device)
+    # >>> model z najlepszymi hiperparametrami
+    model = Net(trial, input_dim=X_full.shape[1]).to(device)
+    criterion = nn.MSELoss()
+    optimizer = get_optimizer(trial, model.parameters())
 
-        # Definicja kryterium straty
-        criterion = nn.MSELoss()
+    batch_size = trial.params.get("batch_size", 32)
+    epochs     = trial.params.get("epochs", 100)
 
-        # Definicja optymalizatora
-        optimizer = get_optimizer(trial, model.parameters())
+    ds_full = torch.utils.data.TensorDataset(
+        torch.tensor(X_full), torch.tensor(y_full))
+    ld_full = torch.utils.data.DataLoader(
+        ds_full, batch_size=batch_size, shuffle=True, drop_last=True)
 
-        # Pobranie hiperparametrów z triala
-        batch_size = trial.params.get('batch_size', 32)
-        epochs = trial.params.get('epochs', 100)
+    # ------- trening ----------------------------------------------------------
+    for _ in range(epochs):
+        model.train()
+        for xb, yb in ld_full:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(xb).squeeze(), yb)
+            loss.backward()
+            optimizer.step()
 
-        # Trenowanie modelu na całym zbiorze danych
-        dataset = torch.utils.data.TensorDataset(torch.tensor(X_full, dtype=torch.float32),
-                                                 torch.tensor(y_full, dtype=torch.float32))
-        loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    # ------- predykcje na CAŁYM zbiorze ---------------------------------------
+    model.eval()
+    with torch.no_grad():
+        y_pred_full = model(
+            torch.tensor(X_full, device=device)).squeeze().cpu().numpy()
 
-        for epoch in range(epochs):
-            model.train()
-            for batch_X, batch_y in loader:
-                batch_X = batch_X.to(device)
-                batch_y = batch_y.to(device)
-                optimizer.zero_grad()
-                outputs = model(batch_X).squeeze()
-                loss = criterion(outputs, batch_y)
-                loss.backward()
-                optimizer.step()
+    # -------------------- metryki --------------------------------------------
+    rmse_train = float(np.sqrt(mean_squared_error(y_full, y_pred_full)))
+    r2_train   = float(r2_score(y_full,       y_pred_full))
+    mlflow.log_metric("rmse_train", rmse_train)
+    mlflow.log_metric("r2_train",   r2_train)
+    print(f"RMSE_train={rmse_train:.4f} | R2_train={r2_train:.4f}")
 
-        model.eval()
-        with torch.no_grad():
-            y_train_pred = model(
-                torch.tensor(X_full, dtype=torch.float32).to(device)
-            ).squeeze().cpu().numpy()
+    # dopisz do pliku podsumowania
+    with open(f"{csv_name}_summary.txt", "a") as fp:
+        fp.write(f"RMSE_train: {rmse_train}\n")
+        fp.write(f"R2_train  : {r2_train}\n")
 
-        r2_train = r2_score(y_full, y_train_pred)
-        mlflow.log_metric("R2_train", r2_train)
-        print(f"R2 on training set: {r2_train:.4f}")
+    # -------------------- ZAPIS MODELU ----------------------------------------
+    torch.save(model.state_dict(), f"{csv_name}_final_model.pth")
+    mlflow.pytorch.log_model(model.cpu(), "model_final")
 
-        summary_file_name = f"{csv_name}_summary.txt" 
-        with open(summary_file_name, "a") as f:         
-            f.write(f"R2_train: {r2_train}\n")
+    # -------------------- WILLIAMS – dane CSV ---------------------------------
+    residuals  = y_full - y_pred_full
+    std_res    = (residuals - residuals.mean()) / residuals.std()
+    out_thr    = 3
 
-        mlflow.log_artifact(summary_file_name)  
+    X_feat = X_full.copy()                      # (N, p)
+    nz     = X_feat.std(axis=0) > 1e-10         # usuń zerowe wariancje
+    X_std  = (X_feat[:, nz] - X_feat[:, nz].mean(0)) / X_feat[:, nz].std(0)
 
-        # Zapisanie modelu
-        model_file_name = f"{csv_name}_final_model.pth"
-        torch.save(model.state_dict(), model_file_name)
-        print(f"Model saved as {model_file_name}")
+    H          = X_std @ np.linalg.pinv(X_std.T @ X_std) @ X_std.T
+    leverage   = np.diag(H)
+    lev_thr    = 3 * X_std.shape[1] / X_std.shape[0]
 
-        # Przeniesienie modelu na CPU i ustawienie w trybie ewaluacji
-        model.to('cpu')
-        model.eval()
-        model = model.float()
+    wdf = pd.DataFrame({
+        "y_true":       y_full,
+        "y_pred":       y_pred_full,
+        "residual":     residuals,
+        "std_residual": std_res,
+        "leverage":     leverage
+    })
 
-        # Przygotowanie przykładu wejściowego
-        input_example = X_full[0:1].astype(np.float32)  # numpy.ndarray
+    full_csv = f"{csv_name}_williams_full.csv"
+    out_csv  = f"{csv_name}_williams_outliers.csv"
+    wdf.to_csv(full_csv, index=False)
+    wdf[(np.abs(std_res) > out_thr) | (leverage > lev_thr)
+        ].to_csv(out_csv, index=False)
+    mlflow.log_artifact(full_csv)
+    mlflow.log_artifact(out_csv)
 
-        # Stworzenie opakowanego modelu
-        wrapped_model = WrappedModel(model)
-
-        # Definicja conda_env lub pip_requirements
-        conda_env = {
-            'channels': ['defaults'],
-            'dependencies': [
-                f'python={sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}',
-                'pip',
-                {
-                    'pip': [
-                        f'torch=={torch.__version__}',
-                        'mlflow',
-                    ],
-                },
-            ],
-            'name': 'mlflow-env'
-        }
-
-        # Ustawienie poziomu logowania na DEBUG
-        import logging
-        logging.getLogger("mlflow").setLevel(logging.DEBUG)
-
-        # Logowanie modelu do MLflow z input_example i conda_env
-        mlflow.pytorch.log_model(
-            wrapped_model,
-            "model",
-            conda_env=conda_env,
-            input_example=input_example
-        )
-        print(f"Model logged to MLflow.")
-
-    except Exception as e:
-        print(f"Error training final model: {e}")
-        raise e
+    print("Williams CSV-y zapisane i zalogowane do MLflow.")
 
 
 if __name__ == '__main__':
@@ -811,6 +795,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train DNN models on CSV files in a directory.')
     parser.add_argument('--csv_path', type=str, required=True, help='Path to the directory containing CSV files.')
     parser.add_argument('--experiment_name', type=str, required=False, default='Default', help='Experiment name in MLflow.')
+    parser.add_argument('--n_trials', type=int, required=False, default=2000, help='Number of trials for Optuna hyperparameter optimization')
 
     args = parser.parse_args()
 
@@ -839,62 +824,64 @@ if __name__ == '__main__':
         print(f"\nProcessing file: {csv_file}")
 
         try:
-            # Rozpoczęcie runu MLflow dla optymalizacji hiperparametrów
+            # Start MLflow run for hyperparameter optimization
             with mlflow.start_run(
-                run_name=f"Optimization_{csv_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
-                tags=tags_config_MLP_1D.mlflow_tags1
+                    run_name=f"Optimization_{csv_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
+                    tags=tags_config_MLP_1D.mlflow_tags1
             ) as optuna_run:
-                # Definicja funkcji celu z przekazaniem csv_path
-                def objective_wrapper(trial):
-                    return objective(trial, csv_path)
 
-                study = optuna.create_study(direction='minimize')
-                study.optimize(objective_wrapper, n_trials=2000)  # Zwiększono liczbę prób
+                # ------------------------------------------------------------
+                # Callback to print each finished trial
+                # ------------------------------------------------------------
+                def print_callback(study: optuna.study.Study,
+                                  frozen: optuna.trial.FrozenTrial) -> None:
+                    print(f"[Trial {frozen.number:>4}]  RMSE = {frozen.value:.5f}",
+                          flush=True)
+
+                objective_wrapper = lambda tr: objective(tr, csv_path)
+
+                study = optuna.create_study(direction="minimize")
+                study.optimize(
+                    objective_wrapper,
+                    n_trials=args.n_trials,
+                    callbacks=[print_callback],
+                    show_progress_bar=True
+                )
 
                 torch.cuda.empty_cache()
 
-                # Logowanie najlepszych parametrów
+                # ---------- best trial ---------------------------------
                 trial = study.best_trial
+                best_trial = trial
+
                 mlflow.log_param("best_value", trial.value)
-                for key, value in trial.params.items():
-                    mlflow.log_param(key, value)
+                for k, v in trial.params.items():
+                    mlflow.log_param(k, v)
 
-                # Generowanie wykresu ważności parametrów po zakończeniu optymalizacji
-                importance_ax = optuna_viz.plot_param_importances(study)
+                # ---------- parameter importance plot ----------------------
+                imp_ax = optuna_viz.plot_param_importances(study)
+                imp_fig = imp_ax.get_figure()
+                imp_png = f"{csv_name}_param_importance.png"
+                imp_fig.savefig(imp_png)
+                mlflow.log_artifact(imp_png)
+                plt.close(imp_fig)
 
-                # Pobranie obiektu Figure z Axes
-                importance_fig = importance_ax.get_figure()
+                # ---------- ważności do JSON --------------------------------
+                imp_json = importance.get_param_importances(study)
+                imp_file = f"{csv_name}_param_importance.json"
+                with open(imp_file, "w") as fp:
+                    json.dump(imp_json, fp, indent=4)
+                mlflow.log_artifact(imp_file)
 
-                # Zapisanie wykresu do pliku PNG
-                importance_fig_file = f"{csv_name}_param_importance.png"
-                importance_fig.savefig(importance_fig_file)
+                # ---------- log RMSE (best trial) ---------------------------
+                mlflow.log_metric("RMSE", trial.user_attrs.get("rmse", None))
 
-                # Log the plot file to MLflow
-                mlflow.log_artifact(importance_fig_file)
-
-                # Close the figure to free resources
-                plt.close(importance_fig)
-
-                # Get hyperparameter importances
-                param_importances = importance.get_param_importances(study)
-
-                # Save hyperparameter importances to a JSON file
-                param_importances_file = f"{csv_name}_param_importance.json"
-                with open(param_importances_file, 'w') as f:
-                    json.dump(param_importances, f, indent=4)
-
-                # Log the JSON file to MLflow
-                mlflow.log_artifact(param_importances_file)
-
-                # Log additional metrics from the best trial
-                mlflow.log_metric("RMSE", trial.user_attrs.get('rmse', None))
-                # Additional metrics can be logged in the evaluate_model_with_cv function
-
-                print(f"Best trial for {csv_file}:")
-                print(f"  Value (RMSE): {trial.value}")
-                print("  Parameters: ")
-                for key, value in trial.params.items():
-                    print(f"    {key}: {value}")
+                # ---------- ładny wydruk na konsolę -------------------------
+                print("\nBest trial:")
+                print(f"  value  : {trial.value:.5f}")
+                for k, v in trial.params.items():
+                    print(f"  {k:<20}: {v}")
+                # ------------------------------------------------------------      
 
             # Start a new MLflow run for model evaluation with cross-validation
             with mlflow.start_run(
