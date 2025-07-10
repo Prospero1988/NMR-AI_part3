@@ -58,7 +58,8 @@ class NMRDataset(Dataset):
         self.labels = labels      # (N,)
 
     def __len__(self):
-        return self.nmr_data.size(0)
+        # Works for both torch.Tensor (size()) and numpy.ndarray (shape)
+        return self.nmr_data.size(0) if hasattr(self.nmr_data, "size") else self.nmr_data.shape[0]
 
     def __getitem__(self, idx):
         return self.nmr_data[idx], self.labels[idx]
@@ -271,7 +272,7 @@ def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epoch
 
     rmse_list = []
     mae_list = []
-    r2_list = []
+    q2_list = []
     pearson_list = []
 
     for fold_idx, (train_idx, val_idx) in enumerate(kf.split(indices)):
@@ -310,7 +311,8 @@ def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epoch
 
         rmse_list.append(val_rmse)
         mae_list.append(mean_absolute_error(y_true_fold, y_pred_fold))
-        r2_list.append(r2_score(y_true_fold, y_pred_fold))
+        # r2_list.append(r2_score(y_true_fold, y_pred_fold))
+        q2_list.append(r2_score(y_true_fold, y_pred_fold))
         pearson_list.append(pearsonr(y_true_fold, y_pred_fold)[0])
 
     y_true_all = np.concatenate(y_true_all)
@@ -322,8 +324,10 @@ def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epoch
         "rmse_std": float(np.std(rmse_list)),
         "mae_mean": float(np.mean(mae_list)),
         "mae_std": float(np.std(mae_list)),
-        "r2_mean": float(np.mean(r2_list)),
-        "r2_std": float(np.std(r2_list)),
+        # "r2_mean": float(np.mean(r2_list)),
+        # "r2_std": float(np.std(r2_list)),
+        "q2_mean": float(np.mean(q2_list)),
+        "q2_std": float(np.std(q2_list)),
         "pearson_mean": float(np.mean(pearson_list)),
         "pearson_std": float(np.std(pearson_list)),
         "y_true_all": y_true_all,
@@ -423,204 +427,295 @@ def main():
     logger = logging.getLogger(__name__)
     logger.info("Script started (CNNOnly, alt). Results directory: %s", res_dir)
 
-    try:
-        logger.info("Running on device: %s", device)
-        X_nmr, y = load_nmr_data(args.path_1h, args.path_13c)
-        # Now X_nmr has shape (N, 1, 2, 200)
+    logger.info("Running on device: %s", device)
+    X_nmr, y = load_nmr_data(args.path_1h, args.path_13c)
+    # Now X_nmr has shape (N, 1, 2, 200)
 
-        # Create tensors
-        X_nmr_t = torch.from_numpy(X_nmr).float()  # already (N,1,2,200)
-        y_t = torch.from_numpy(y).float()
+    # Create tensors
+    X_nmr_t = torch.from_numpy(X_nmr).float()  # already (N,1,2,200)
+    y_t = torch.from_numpy(y).float()
 
-        dataset = NMRDataset(X_nmr_t, y_t)
+    dataset = NMRDataset(X_nmr_t, y_t)
 
-        mlflow.set_experiment(args.experiment_name)
-        study = optuna.create_study(direction="minimize")
-        logger.info("Starting study.optimize (n_trials=%d)", args.n_trials)
-        study.optimize(lambda tr: objective(tr, dataset, device), n_trials=args.n_trials)
+    mlflow.set_experiment(args.experiment_name)
+    study = optuna.create_study(direction="minimize")
+    logger.info("Starting study.optimize (n_trials=%d)", args.n_trials)
+    study.optimize(lambda tr: objective(tr, dataset, device), n_trials=args.n_trials)
 
-        best_params = study.best_params
-        best_value = study.best_value
-        logger.info("Optuna finished. Best parameters: %s, RMSE=%f", best_params, best_value)
+    best_params = study.best_params
+    best_value = study.best_value
+    logger.info("Optuna finished. Best parameters: %s, RMSE=%f", best_params, best_value)
 
-        with mlflow.start_run(run_name="CNNOnly_10CV_AltData") as run:
-            run_tags = dict(MLFLOW_TAGS)
-            run_tags["file"] = prefix 
-            mlflow.set_tags(run_tags)
-            mlflow.log_params(best_params)
-            mlflow.log_param("n_trials", args.n_trials)
-            mlflow.log_param("epochs_10cv", args.epochs_10cv)
+    with mlflow.start_run(run_name="CNNOnly_10CV_AltData") as run:
+        run_tags = dict(MLFLOW_TAGS)
+        run_tags["file"] = prefix 
+        mlflow.set_tags(run_tags)
+        mlflow.log_params(best_params)
+        mlflow.log_param("n_trials", args.n_trials)
+        mlflow.log_param("epochs_10cv", args.epochs_10cv)
 
-            # (1) Trials history
-            df_trials = study.trials_dataframe(attrs=("number", "value", "params", "state"))
-            csv_optuna = os.path.join(res_dir, "optuna_trials_cnnonly_alt.csv")
-            df_trials.to_csv(csv_optuna, index=False)
-            mlflow.log_artifact(csv_optuna)
+        # (1) Trials history
+        df_trials = study.trials_dataframe(attrs=("number", "value", "params", "state"))
+        csv_optuna = os.path.join(res_dir, "optuna_trials_cnnonly_alt.csv")
+        df_trials.to_csv(csv_optuna, index=False)
+        mlflow.log_artifact(csv_optuna)
 
-            # RMSE vs Trial ID plot
-            plot_trials_path = os.path.join(res_dir, "optuna_trials_rmse_cnnonly_alt.png")
-            fig = plt.figure()
-            plt.plot(df_trials["number"], df_trials["value"], marker="o", linestyle="-")
-            plt.xlabel("Trial ID")
-            plt.ylabel("RMSE (3CV)")
-            plt.title("Optuna: RMSE vs Trial ID (CNNOnly, alt)")
-            plt.grid(True)
-            plt.savefig(plot_trials_path, dpi=300, bbox_inches="tight")
-            mlflow.log_artifact(plot_trials_path)
-            plt.close(fig)
+        # RMSE vs Trial ID plot
+        plot_trials_path = os.path.join(res_dir, "optuna_trials_rmse_cnnonly_alt.png")
+        fig = plt.figure()
+        plt.plot(df_trials["number"], df_trials["value"], marker="o", linestyle="-")
+        plt.xlabel("Trial ID")
+        plt.ylabel("RMSE (3CV)")
+        plt.title("Optuna: RMSE vs Trial ID (CNNOnly, alt)")
+        plt.grid(True)
+        plt.savefig(plot_trials_path, dpi=300, bbox_inches="tight")
+        mlflow.log_artifact(plot_trials_path)
+        plt.close(fig)
 
-            # (2) Hyperparameter importance
-            param_importances = get_param_importances(study)
-            json_path = os.path.join(res_dir, "param_importances_cnnonly_alt.json")
-            with open(json_path, "w") as f:
-                json.dump(param_importances, f, indent=2)
-            mlflow.log_artifact(json_path)
+        # (2) Hyperparameter importance
+        param_importances = get_param_importances(study)
+        json_path = os.path.join(res_dir, "param_importances_cnnonly_alt.json")
+        with open(json_path, "w") as f:
+            json.dump(param_importances, f, indent=2)
+        mlflow.log_artifact(json_path)
 
-            fig_imp = optuna_viz.plot_param_importances(study)
-            fig_real = fig_imp.figure
-            fig_imp_path = os.path.join(res_dir, "param_importances_cnnonly_alt.png")
-            fig_real.savefig(fig_imp_path, dpi=300, bbox_inches="tight")
-            mlflow.log_artifact(fig_imp_path)
-            plt.close(fig_real)
+        fig_imp = optuna_viz.plot_param_importances(study)
+        fig_real = fig_imp.figure
+        fig_imp_path = os.path.join(res_dir, "param_importances_cnnonly_alt.png")
+        fig_real.savefig(fig_imp_path, dpi=300, bbox_inches="tight")
+        mlflow.log_artifact(fig_imp_path)
+        plt.close(fig_real)
 
-            # (3) 10CV with best hyperparameters
-            def best_model_func():
-                class FrozenTrialStub:
-                    def suggest_int(self, name, low, high, step=None, log=False):
-                        return best_params[name]
-                    def suggest_float(self, name, low, high, step=None, log=False):
-                        return best_params[name]
-                    def suggest_categorical(self, name, choices):
-                        return best_params[name]
+        # (3) 10CV with best hyperparameters
+        def best_model_func():
+            class FrozenTrialStub:
+                def suggest_int(self, name, low, high, step=None, log=False):
+                    return best_params[name]
+                def suggest_float(self, name, low, high, step=None, log=False):
+                    return best_params[name]
+                def suggest_categorical(self, name, choices):
+                    return best_params[name]
 
-                trial_stub = FrozenTrialStub()
-                model = CNN2DAlt(trial_stub)
-                optimizer_name = best_params["optimizer"]
-                lr = best_params["lr"]
-                if optimizer_name == "Adam":
-                    opt = optim.Adam(model.parameters(), lr=lr)
-                elif optimizer_name == "SGD":
-                    opt = optim.SGD(model.parameters(), lr=lr, momentum=0.9)
-                else:
-                    opt = optim.RMSprop(model.parameters(), lr=lr)
-                return model, opt
+            trial_stub = FrozenTrialStub()
+            model = CNN2DAlt(trial_stub)
+            optimizer_name = best_params["optimizer"]
+            lr = best_params["lr"]
+            if optimizer_name == "Adam":
+                opt = optim.Adam(model.parameters(), lr=lr)
+            elif optimizer_name == "SGD":
+                opt = optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+            else:
+                opt = optim.RMSprop(model.parameters(), lr=lr)
+            return model, opt
 
-            logger.info("Starting 10CV with parameters: %s", best_params)
-            results = cross_validate(
-                model_func=best_model_func,
-                dataset=dataset,
-                device=device,
-                batch_size=best_params["batch_size"],
-                n_folds=10,
-                epochs=args.epochs_10cv
+        logger.info("Starting 10CV with parameters: %s", best_params)
+        results = cross_validate(
+            model_func=best_model_func,
+            dataset=dataset,
+            device=device,
+            batch_size=best_params["batch_size"],
+            n_folds=10,
+            epochs=args.epochs_10cv
+        )
+
+        rmse_mean = results["rmse_mean"]
+        rmse_std = results["rmse_std"]
+        mae_mean = results["mae_mean"]
+        mae_std = results["mae_std"]
+        q2_mean = results["q2_mean"]
+        q2_std = results["q2_std"]
+        pearson_mean = results["pearson_mean"]
+        pearson_std = results["pearson_std"]
+
+        y_true_all = results["y_true_all"]
+        y_pred_all = results["y_pred_all"]
+        logger.info("10CV finished. RMSE=%.4f±%.4f, MAE=%.4f±%.4f",
+                    rmse_mean, rmse_std, mae_mean, mae_std)
+
+        # Log metrics to MLflow
+        mlflow.log_metric("rmse_mean_10cv", rmse_mean)
+        mlflow.log_metric("rmse_std_10cv", rmse_std)
+        mlflow.log_metric("mae_mean_10cv", mae_mean)
+        mlflow.log_metric("mae_std_10cv", mae_std)
+        mlflow.log_metric("q2_mean_10cv", q2_mean)
+        mlflow.log_metric("q2_std_10cv", q2_std)
+        mlflow.log_metric("pearson_mean_10cv", pearson_mean)
+        mlflow.log_metric("pearson_std_10cv", pearson_std)
+
+        # Save metrics
+        metrics_path = os.path.join(res_dir, "metrics_cnnonly_alt.csv")
+        with open(metrics_path, "w") as f:
+            f.write("metric,mean,std\n")
+            f.write(f"rmse,{rmse_mean},{rmse_std}\n")
+            f.write(f"mae,{mae_mean},{mae_std}\n")
+            f.write(f"q2,{q2_mean},{q2_std}\n")
+            f.write(f"pearson,{pearson_mean},{pearson_std}\n")
+        mlflow.log_artifact(metrics_path)
+
+        # Save hyperparameters
+        hyperparams_path = os.path.join(res_dir, "hyperparams_cnnonly_alt.csv")
+        with open(hyperparams_path, "w") as f:
+            f.write("param,value\n")
+            for k, v in best_params.items():
+                f.write(f"{k},{v}\n")
+        mlflow.log_artifact(hyperparams_path)
+
+        # Save predictions
+        fold_indices_all = results["fold_indices_all"]
+        df_cv = pd.DataFrame({
+            "fold": fold_indices_all,
+            "y_true": y_true_all,
+            "y_pred": y_pred_all
+        })
+        cv_csv_path = os.path.join(res_dir, "cv_predictions_cnnonly_alt.csv")
+        df_cv.to_csv(cv_csv_path, index=False)
+        mlflow.log_artifact(cv_csv_path)
+
+        # Plot y_true vs y_pred
+        plot_path = os.path.join(res_dir, "real_vs_pred_plot_cnnonly_alt.png")
+        plt.figure(figsize=(6, 6))
+        plt.scatter(y_true_all, y_pred_all, alpha=0.5)
+        plt.xlabel("True y")
+        plt.ylabel("Predicted y")
+        plt.title("CNNOnly (alt data): Real vs. Pred (10CV)")
+        plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+        mlflow.log_artifact(plot_path)
+        plt.close()
+
+        # Plot absolute error
+        error_plot = os.path.join(res_dir, "error_plot_cnnonly_alt.png")
+        plt.figure(figsize=(6, 6))
+        abs_error = np.abs(y_true_all - y_pred_all)
+        plt.scatter(y_true_all, abs_error, alpha=0.5)
+        plt.xlabel("True y")
+        plt.ylabel("|y_true - y_pred|")
+        plt.title("Absolute error vs. y_true (10CV) - CNNOnly alt")
+        plt.savefig(error_plot, dpi=300, bbox_inches="tight")
+        mlflow.log_artifact(error_plot)
+        plt.close()
+
+        # (4) Final model training on the whole dataset
+        final_model, final_optimizer = best_model_func()
+        final_model.to(device)
+        loss_fn = nn.MSELoss()
+        full_loader = DataLoader(dataset, batch_size=best_params["batch_size"], shuffle=True)
+
+        best_rmse_full = float("inf")
+        patience_counter = 0
+        max_patience = 5
+        for epoch in range(args.epochs_10cv):
+            train_loss = train_one_epoch(final_model, full_loader, final_optimizer, loss_fn, device)
+            _, full_rmse, _, _ = validate(final_model, full_loader, loss_fn, device)
+            if full_rmse < best_rmse_full:
+                best_rmse_full = full_rmse
+                patience_counter = 0
+            else:
+                patience_counter += 1
+            if patience_counter >= max_patience:
+                break
+
+        mlflow.pytorch.log_model(final_model, artifact_path="model_cnnonly_alt")
+
+        # ----------------------------------------------------------
+        # ❶ Save final model & best hyper-parameters
+        # ----------------------------------------------------------
+        model_path = os.path.join(res_dir,
+                                    f"{prefix}_final_model_cnnonly_alt.pth")
+        torch.save(final_model.state_dict(), model_path)
+        mlflow.log_artifact(model_path)
+
+        best_params_json = os.path.join(res_dir,
+                                        f"{prefix}_best_params.json")
+        with open(best_params_json, "w") as fp:
+            json.dump(best_params, fp, indent=2)
+        mlflow.log_artifact(best_params_json)
+
+        # ----------------------------------------------------------
+        # ❷ Metrics on the whole training set
+        # ----------------------------------------------------------
+        full_loader_eval = DataLoader(dataset,
+                                        batch_size=best_params["batch_size"],
+                                        shuffle=False)
+        _, rmse_train, y_true_full, y_pred_full = validate(
+            final_model, full_loader_eval, loss_fn, device
+        )
+        r2_train = r2_score(y_true_full, y_pred_full)
+
+        mlflow.log_metric("rmse_train", rmse_train)
+        mlflow.log_metric("r2_train",  r2_train)
+
+        metrics_final = os.path.join(res_dir,
+                                        "metrics_cnnonly_alt_final.csv")
+        with open(metrics_final, "w") as fm:
+            fm.write("metric,value\n")
+            fm.write(f"rmse_train,{rmse_train}\n")
+            fm.write(f"r2_train,{r2_train}\n")
+        mlflow.log_artifact(metrics_final)
+
+        # ----------------------------------------------------------
+        # ❸ Williams-plot data
+        # ----------------------------------------------------------
+        def _write_williams_csv():
+            # Reload original CSVs to get molecule names
+            df_1h = pd.read_csv(args.path_1h)
+            df_13c = pd.read_csv(args.path_13c)
+
+            # align column names
+            df_1h.columns = ["MOLECULE_NAME", "LABEL"] + [f"h_{i}" for i in range(df_1h.shape[1] - 2)]
+            df_13c.columns = ["MOLECULE_NAME", "LABEL"] + [f"c_{i}" for i in range(df_13c.shape[1] - 2)]
+
+            merged = pd.merge(
+                df_1h, df_13c,
+                on=["MOLECULE_NAME", "LABEL"], how="inner"
+            )
+            h_cols = [c for c in merged.columns if c.startswith("h_")]
+            c_cols = [c for c in merged.columns if c.startswith("c_")]
+
+            X = np.hstack([merged[h_cols].values,
+                            merged[c_cols].values])  # (N, 400)
+            # Z-score each column
+            X = (X - X.mean(0)) / (X.std(0) + 1e-8)
+
+            # Hat-matrix diagonal (leverage)
+            xtx_inv = np.linalg.pinv(X.T @ X)
+            leverage = np.einsum("ij,jk,ik->i", X, xtx_inv, X)
+
+            residuals = y_true_full - y_pred_full
+            std_res = residuals / (rmse_train *
+                                    np.sqrt(1.0 - leverage + 1e-8))
+
+            p, n = X.shape[1], X.shape[0]
+            h_star = 3.0 * (p + 1) / n
+            is_outlier = (np.abs(std_res) > 3.0) | (leverage > h_star)
+
+            df_w = pd.DataFrame({
+                "sample_id": merged["MOLECULE_NAME"],
+                "y_true":    y_true_full,
+                "y_pred":    y_pred_full,
+                "std_residual": std_res,
+                "leverage":     leverage
+            })
+
+            input_base  = prefix                    # before first "_"
+            model_base  = os.path.basename(sys.argv[0]).split("_")[0]
+            full_csv    = os.path.join(
+                res_dir, f"{input_base}_{model_base}_williams_full.csv"
+            )
+            out_csv     = os.path.join(
+                res_dir, f"{input_base}_{model_base}_williams_outliers.csv"
             )
 
-            rmse_mean = results["rmse_mean"]
-            rmse_std = results["rmse_std"]
-            mae_mean = results["mae_mean"]
-            mae_std = results["mae_std"]
-            r2_mean = results["r2_mean"]
-            r2_std = results["r2_std"]
-            pearson_mean = results["pearson_mean"]
-            pearson_std = results["pearson_std"]
+            df_w.to_csv(full_csv, index=False)
+            df_w[is_outlier].to_csv(out_csv, index=False)
+            mlflow.log_artifact(full_csv)
+            mlflow.log_artifact(out_csv)
 
-            y_true_all = results["y_true_all"]
-            y_pred_all = results["y_pred_all"]
-            logger.info("10CV finished. RMSE=%.4f±%.4f, MAE=%.4f±%.4f",
-                        rmse_mean, rmse_std, mae_mean, mae_std)
-
-            # Log metrics to MLflow
-            mlflow.log_metric("rmse_mean_10cv", rmse_mean)
-            mlflow.log_metric("rmse_std_10cv", rmse_std)
-            mlflow.log_metric("mae_mean_10cv", mae_mean)
-            mlflow.log_metric("mae_std_10cv", mae_std)
-            mlflow.log_metric("r2_mean_10cv", r2_mean)
-            mlflow.log_metric("r2_std_10cv", r2_std)
-            mlflow.log_metric("pearson_mean_10cv", pearson_mean)
-            mlflow.log_metric("pearson_std_10cv", pearson_std)
-
-            # Save metrics
-            metrics_path = os.path.join(res_dir, "metrics_cnnonly_alt.csv")
-            with open(metrics_path, "w") as f:
-                f.write("metric,mean,std\n")
-                f.write(f"rmse,{rmse_mean},{rmse_std}\n")
-                f.write(f"mae,{mae_mean},{mae_std}\n")
-                f.write(f"r2,{r2_mean},{r2_std}\n")
-                f.write(f"pearson,{pearson_mean},{pearson_std}\n")
-            mlflow.log_artifact(metrics_path)
-
-            # Save hyperparameters
-            hyperparams_path = os.path.join(res_dir, "hyperparams_cnnonly_alt.csv")
-            with open(hyperparams_path, "w") as f:
-                f.write("param,value\n")
-                for k, v in best_params.items():
-                    f.write(f"{k},{v}\n")
-            mlflow.log_artifact(hyperparams_path)
-
-            # Save predictions
-            fold_indices_all = results["fold_indices_all"]
-            df_cv = pd.DataFrame({
-                "fold": fold_indices_all,
-                "y_true": y_true_all,
-                "y_pred": y_pred_all
-            })
-            cv_csv_path = os.path.join(res_dir, "cv_predictions_cnnonly_alt.csv")
-            df_cv.to_csv(cv_csv_path, index=False)
-            mlflow.log_artifact(cv_csv_path)
-
-            # Plot y_true vs y_pred
-            plot_path = os.path.join(res_dir, "real_vs_pred_plot_cnnonly_alt.png")
-            plt.figure(figsize=(6, 6))
-            plt.scatter(y_true_all, y_pred_all, alpha=0.5)
-            plt.xlabel("True y")
-            plt.ylabel("Predicted y")
-            plt.title("CNNOnly (alt data): Real vs. Pred (10CV)")
-            plt.savefig(plot_path, dpi=300, bbox_inches="tight")
-            mlflow.log_artifact(plot_path)
-            plt.close()
-
-            # Plot absolute error
-            error_plot = os.path.join(res_dir, "error_plot_cnnonly_alt.png")
-            plt.figure(figsize=(6, 6))
-            abs_error = np.abs(y_true_all - y_pred_all)
-            plt.scatter(y_true_all, abs_error, alpha=0.5)
-            plt.xlabel("True y")
-            plt.ylabel("|y_true - y_pred|")
-            plt.title("Absolute error vs. y_true (10CV) - CNNOnly alt")
-            plt.savefig(error_plot, dpi=300, bbox_inches="tight")
-            mlflow.log_artifact(error_plot)
-            plt.close()
-
-            # (4) Final model training on the whole dataset
-            final_model, final_optimizer = best_model_func()
-            final_model.to(device)
-            loss_fn = nn.MSELoss()
-            full_loader = DataLoader(dataset, batch_size=best_params["batch_size"], shuffle=True)
-
-            best_rmse_full = float("inf")
-            patience_counter = 0
-            max_patience = 5
-            for epoch in range(args.epochs_10cv):
-                train_loss = train_one_epoch(final_model, full_loader, final_optimizer, loss_fn, device)
-                _, full_rmse, _, _ = validate(final_model, full_loader, loss_fn, device)
-                if full_rmse < best_rmse_full:
-                    best_rmse_full = full_rmse
-                    patience_counter = 0
-                else:
-                    patience_counter += 1
-                if patience_counter >= max_patience:
-                    break
-
-            mlflow.pytorch.log_model(final_model, artifact_path="model_cnnonly_alt")
-
-            mlflow.end_run()
-
-        logger.info("Script (CNNOnly, alt) finished successfully.")
-
-    except Exception as e:
-        logger.exception("Error during script execution (CNNOnly, alt).")
-        sys.exit(1)
-
-
+        _write_williams_csv()
+        logger.info("Final model training completed. RMSE on full dataset: %.4f",
+                    best_rmse_full)
+        
+# ----------------------------------------------------------------------------- #
+# Entry-point
+# ----------------------------------------------------------------------------- #
 if __name__ == "__main__":
     main()

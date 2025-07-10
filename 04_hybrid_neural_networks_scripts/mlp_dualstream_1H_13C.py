@@ -233,8 +233,8 @@ def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epoch
     fold_indices_all = []
 
     rmse_list = []
-    mae_list = []
-    r2_list = []
+    mae_list  = []
+    q2_list = []
     pearson_list = []
 
     for fold_idx, (train_idx, val_idx) in enumerate(kf.split(indices)):
@@ -273,7 +273,7 @@ def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epoch
 
         rmse_list.append(val_rmse)
         mae_list.append(mean_absolute_error(y_true_fold, y_pred_fold))
-        r2_list.append(r2_score(y_true_fold, y_pred_fold))
+        q2_list.append(r2_score(y_true_fold, y_pred_fold))
         pearson_list.append(pearsonr(y_true_fold, y_pred_fold)[0])
 
     y_true_all = np.concatenate(y_true_all)
@@ -282,11 +282,11 @@ def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epoch
 
     results = {
         "rmse_mean": float(np.mean(rmse_list)),
-        "rmse_std": float(np.std(rmse_list)),
-        "mae_mean": float(np.mean(mae_list)),
-        "mae_std": float(np.std(mae_list)),
-        "r2_mean": float(np.mean(r2_list)),
-        "r2_std": float(np.std(r2_list)),
+        "rmse_std":  float(np.std(rmse_list)),
+        "mae_mean":  float(np.mean(mae_list)),
+        "mae_std":   float(np.std(mae_list)),
+        "q2_mean":   float(np.mean(q2_list)),
+        "q2_std":    float(np.std(q2_list)),
         "pearson_mean": float(np.mean(pearson_list)),
         "pearson_std": float(np.std(pearson_list)),
         "y_true_all": y_true_all,
@@ -494,8 +494,8 @@ def main():
             rmse_std = results["rmse_std"]
             mae_mean = results["mae_mean"]
             mae_std = results["mae_std"]
-            r2_mean = results["r2_mean"]
-            r2_std = results["r2_std"]
+            q2_mean = results["q2_mean"]
+            q2_std  = results["q2_std"]
             pearson_mean = results["pearson_mean"]
             pearson_std = results["pearson_std"]
 
@@ -508,8 +508,8 @@ def main():
             mlflow.log_metric("rmse_std_10cv", rmse_std)
             mlflow.log_metric("mae_mean_10cv", mae_mean)
             mlflow.log_metric("mae_std_10cv", mae_std)
-            mlflow.log_metric("r2_mean_10cv", r2_mean)
-            mlflow.log_metric("r2_std_10cv", r2_std)
+            mlflow.log_metric("q2_mean_10cv", q2_mean)
+            mlflow.log_metric("q2_std_10cv",  q2_std)
             mlflow.log_metric("pearson_mean_10cv", pearson_mean)
             mlflow.log_metric("pearson_std_10cv", pearson_std)
 
@@ -519,7 +519,7 @@ def main():
                 f.write("metric,mean,std\n")
                 f.write(f"rmse,{rmse_mean},{rmse_std}\n")
                 f.write(f"mae,{mae_mean},{mae_std}\n")
-                f.write(f"r2,{r2_mean},{r2_std}\n")
+                f.write(f"q2,{q2_mean},{q2_std}\n")
                 f.write(f"pearson,{pearson_mean},{pearson_std}\n")
             mlflow.log_artifact(metrics_path)
 
@@ -621,6 +621,18 @@ def main():
             out_csv = os.path.join(res_dir, f"{prefix}_williams_outliers.csv")
             outliers_df.to_csv(out_csv, index=False)
             mlflow.log_artifact(out_csv)
+
+            # -------- Metrics on full training set --------
+            rmse_train = float(np.sqrt(mean_squared_error(y, y_pred)))
+            r2_train   = float(r2_score(y, y_pred))
+            mlflow.log_metric("rmse_train", rmse_train)
+            mlflow.log_metric("r2_train",   r2_train)
+
+            with open(os.path.join(res_dir, "metrics_mlpdual_final.csv"), "w") as f:
+                f.write("metric,value\n")
+                f.write(f"rmse_train,{rmse_train}\n")
+                f.write(f"r2_train,{r2_train}\n")
+            mlflow.log_artifact(os.path.join(res_dir, "metrics_mlpdual_final.csv"))
 
             mlflow.end_run()
 

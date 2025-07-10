@@ -283,7 +283,7 @@ def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epoch
     fold_idx_all = []
     rmse_l = []
     mae_l = []
-    r2_l = []
+    q2_l = []
     pearson_l = []
 
     for fold, (tr_idx, val_idx) in enumerate(kf.split(indices)):
@@ -317,7 +317,8 @@ def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epoch
 
         rmse_l.append(rmse)
         mae_l.append(mean_absolute_error(y_t, y_p))
-        r2_l.append(r2_score(y_t, y_p))
+        # r2_l.append(r2_score(y_t, y_p))
+        q2_l.append(r2_score(y_t, y_p))
         pearson_l.append(pearsonr(y_t, y_p)[0])
 
     y_true_all = np.concatenate(y_true_all)
@@ -327,7 +328,8 @@ def cross_validate(model_func, dataset, device, batch_size=64, n_folds=10, epoch
     return dict(
         rmse_mean=float(np.mean(rmse_l)), rmse_std=float(np.std(rmse_l)),
         mae_mean=float(np.mean(mae_l)), mae_std=float(np.std(mae_l)),
-        r2_mean=float(np.mean(r2_l)), r2_std=float(np.std(r2_l)),
+        # r2_mean=float(np.mean(r2_l)), r2_std=float(np.std(r2_l)),
+        q2_mean=float(np.mean(q2_l)), q2_std=float(np.std(q2_l)),
         pearson_mean=float(np.mean(pearson_l)), pearson_std=float(np.std(pearson_l)),
         y_true_all=y_true_all, y_pred_all=y_pred_all, fold_indices_all=fold_idx_all
     )
@@ -487,6 +489,16 @@ def main():
             for k, v in cv_res.items():
                 if isinstance(v, float):
                     mlflow.log_metric(f"{k}_10cv", v)
+
+                # --- CSV z 10CV metrics ---
+                with open(os.path.join(res_dir, "metrics_cnndual_10cv.csv"), "w") as f:
+                    f.write("metric,mean,std\n")
+                    f.write(f"rmse_mean,{cv_res['rmse_mean']},{cv_res['rmse_std']}\n")
+                    f.write(f"mae_mean,{cv_res['mae_mean']},{cv_res['mae_std']}\n")
+                    f.write(f"q2_mean,{cv_res['q2_mean']},{cv_res['q2_std']}\n")
+                    f.write(f"pearson_mean,{cv_res['pearson_mean']},{cv_res['pearson_std']}\n")
+                mlflow.log_artifact(os.path.join(res_dir, "metrics_cnndual_10cv.csv"))
+
             # Save tables/metrics
             pd.DataFrame({
                 "fold": cv_res["fold_indices_all"],
@@ -571,15 +583,31 @@ def main():
             assert len(will_df) == len(y), f"Mismatch rows: {len(will_df)} vs {len(y)}"
 
             # Save and log full table
-            full_path = f"{prefix}_cnn_dual_williams_full.csv"
+            full_path = os.path.join(
+                res_dir, f"{prefix}_cnn_dual_williams_full.csv"
+            )
             will_df.to_csv(full_path, index=False)
             mlflow.log_artifact(full_path)
 
             # Filter outliers
             out_df = will_df[(np.abs(std_resid) > out_thr) | (leverage > lev_thr)].copy()
-            out_path = f"{prefix}_cnn_dual_williams_outliers.csv"
+            out_path = os.path.join(
+                res_dir, f"{prefix}_cnn_dual_williams_outliers.csv"
+            )
             out_df.to_csv(out_path, index=False)
             mlflow.log_artifact(out_path)
+            
+            # -------- Metrics on full training set --------
+            rmse_train = float(np.sqrt(mean_squared_error(y, y_pred)))
+            r2_train   = float(r2_score(y, y_pred))
+            mlflow.log_metric("rmse_train", rmse_train)
+            mlflow.log_metric("r2_train",   r2_train)
+
+            with open(os.path.join(res_dir, "metrics_cnndual_final.csv"), "w") as f:
+                f.write("metric,value\n")
+                f.write(f"rmse_train,{rmse_train}\n")
+                f.write(f"r2_train,{r2_train}\n")
+            mlflow.log_artifact(os.path.join(res_dir, "metrics_cnndual_final.csv"))
 
         logger.info("CNNDual run finished successfully")
 
