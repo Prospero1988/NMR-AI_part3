@@ -38,6 +38,7 @@ import optuna.visualization.matplotlib as optuna_viz
 
 from pathlib import Path
 
+
 # ---------------------------------------------------------------------------------
 # MLflow tags (optional)
 # ---------------------------------------------------------------------------------
@@ -109,8 +110,11 @@ class MLPDual(nn.Module):
     """
     Dual-stream MLP for NMR data (¹H and ¹³C) with optional cross-attention.
     """
-    def __init__(self, trial: optuna.Trial):
+    def __init__(self, trial: optuna.Trial, in_dim: int):
         super().__init__()
+
+        assert in_dim is not None and in_dim > 0, "`in_dim` cannot be None/0"
+
         act = nn.SiLU()
         num_layers = trial.suggest_int("mlp_num_layers", 1, 6)
         dropout = trial.suggest_float("mlp_dropout", 0.0, 0.6, step=0.1)
@@ -122,8 +126,7 @@ class MLPDual(nn.Module):
         if self.use_ca and embed_dim % num_heads != 0:
             embed_dim = math.ceil(embed_dim / num_heads) * num_heads
 
-        def make_stream(prefix: str):
-            in_dim = 200
+        def make_stream(prefix: str, in_dim: int):
             layers = []
             for i in range(num_layers):
                 out_dim = trial.suggest_int(f"{prefix}_h_l{i}", 32, 1024, log=True)
@@ -132,8 +135,8 @@ class MLPDual(nn.Module):
             layers += [nn.Linear(in_dim, embed_dim), act]
             return nn.Sequential(*layers)
 
-        self.stream_h = make_stream("h")
-        self.stream_c = make_stream("c")
+        self.stream_h = make_stream("h", in_dim)
+        self.stream_c = make_stream("c", in_dim)
 
         if self.use_ca:
             self.ca_h_on_c = CrossAttentionBlock(embed_dim, num_heads)
@@ -317,7 +320,7 @@ def objective(trial, dataset, device):
         train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False)
 
-        model, optimizer = create_model_and_optimizer(trial)
+        model, optimizer = create_model_and_optimizer(trial, in_dim=dataset.X.shape[-1])
         model.to(device)
         loss_fn = nn.MSELoss()
 
@@ -349,11 +352,11 @@ def objective(trial, dataset, device):
 # =================================================================================
 # Model and optimizer factory for MLPDual
 # =================================================================================
-def create_model_and_optimizer(trial):
+def create_model_and_optimizer(trial, in_dim):
     """
     Create an MLPDual model and optimizer based on Optuna trial parameters.
     """
-    model = MLPDual(trial)
+    model = MLPDual(trial, in_dim=in_dim)
     optimizer_name = trial.suggest_categorical("optimizer", ["Adam", "SGD", "RMSProp"])
     lr = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
     if optimizer_name == "Adam":
@@ -469,7 +472,7 @@ def main():
                         return best_params[name]
 
                 trial_stub = FrozenTrialStub()
-                model = MLPDual(trial_stub)
+                model = MLPDual(trial_stub, in_dim=dataset.X.shape[-1])
                 optimizer_name = best_params["optimizer"]
                 lr = best_params["lr"]
                 if optimizer_name == "Adam":

@@ -96,6 +96,14 @@ def load_nmr_data(path_1h: str, path_13c: str) -> Tuple[pd.Series, np.ndarray, n
 
     x_h = merged[h_cols].values.astype(np.float32)   # (N,200)
     x_c = merged[c_cols].values.astype(np.float32)
+
+    # --- ASESERTIONS „SANITY CHECK” ---
+    W_h, W_c = x_h.shape[1], x_c.shape[1]
+    assert W_h == W_c, (
+        f"¹H has {W_h} columns, ¹³C has {W_c}. Spectra must share this same length!"
+    )
+    assert W_h >= 64, "A spectrum < 64 points is too short for CNN."
+
     x_nmr = np.stack([x_h, x_c], axis=1)             # (N,2,200)
     y = merged["LABEL"].values.astype(np.float32)
 
@@ -116,101 +124,107 @@ def conv_block_1d(in_ch: int, out_ch: int, k: int, s: int, p: int, dropout: floa
 
 class CNNDual(nn.Module):
     """
-    Dual-stream 1D CNN for NMR data (¹H and ¹³C).
+    Dual-stream 1-D CNN for NMR spectra (B, 2, W).
+    Each stream → Conv1D blocks → GAP → FC  → (optionally) cross-attention → head.
+    An automatic check aborts forward() when the input spectrum is
+    shorter than the total stride of the convolutional stack.
     """
-    def __init__(self, trial):
+    def __init__(self, trial: optuna.Trial):
         super().__init__()
 
         dropout = trial.suggest_float("dropout", 0.0, 0.5, step=0.1)
-        use_bn = trial.suggest_categorical("use_bn", [True, False])
+        use_bn  = trial.suggest_categorical("use_bn", [True, False])
 
-        # ¹H stream
-        in_ch = 1
-        layers_h = []
+        # ----- ¹H stream -----------------------------------------------------
+        in_ch   = 1
+        layers_h, strides_h = [], []
         n_conv_h = trial.suggest_int("n_conv_h", 1, 4)
         for i in range(n_conv_h):
             out_ch = trial.suggest_int(f"h_ch_l{i}", 8, 128, log=True)
-            k = trial.suggest_int(f"h_k_l{i}", 3, 15, step=2)
-            s = trial.suggest_int(f"h_s_l{i}", 1, 3)
-            p = (k - 1) // 2
+            k      = trial.suggest_int(f"h_k_l{i}", 3, 15, step=2)
+            s      = trial.suggest_int(f"h_s_l{i}", 1, 3)
+            p      = (k - 1) // 2                     # same-padding
             layers_h += conv_block_1d(in_ch, out_ch, k, s, p, dropout, use_bn)
+            strides_h.append(s)
             in_ch = out_ch
-        self.stream_h = nn.Sequential(*layers_h, nn.AdaptiveAvgPool1d(1))  # GAP → (B, C_h, 1)
-        self.c_out_h = in_ch
+        self.stream_h = nn.Sequential(*layers_h, nn.AdaptiveAvgPool1d(1))
+        self.c_out_h  = in_ch
+        self.total_stride_h = math.prod(strides_h) if strides_h else 1
 
-        # ¹³C stream
-        in_ch = 1
-        layers_c = []
+        # ----- ¹³C stream ----------------------------------------------------
+        in_ch   = 1
+        layers_c, strides_c = [], []
         n_conv_c = trial.suggest_int("n_conv_c", 1, 4)
         for i in range(n_conv_c):
             out_ch = trial.suggest_int(f"c_ch_l{i}", 8, 128, log=True)
-            k = trial.suggest_int(f"c_k_l{i}", 3, 15, step=2)
-            s = trial.suggest_int(f"c_s_l{i}", 1, 3)
-            p = (k - 1) // 2
+            k      = trial.suggest_int(f"c_k_l{i}", 3, 15, step=2)
+            s      = trial.suggest_int(f"c_s_l{i}", 1, 3)
+            p      = (k - 1) // 2
             layers_c += conv_block_1d(in_ch, out_ch, k, s, p, dropout, use_bn)
+            strides_c.append(s)
             in_ch = out_ch
         self.stream_c = nn.Sequential(*layers_c, nn.AdaptiveAvgPool1d(1))
-        self.c_out_c = in_ch
+        self.c_out_c  = in_ch
+        self.total_stride_c = math.prod(strides_c) if strides_c else 1
 
-        # Embedding FC for both streams
+        # ----- embedding & optional cross-attention --------------------------
         embed_dim = trial.suggest_int("embed_dim", 32, 256, log=True)
         self.fc_h = nn.Linear(self.c_out_h, embed_dim)
         self.fc_c = nn.Linear(self.c_out_c, embed_dim)
 
-        # Cross-attention
-        use_xattn = trial.suggest_categorical("use_xattn", [True, False])
-        self.use_xattn = use_xattn
-        if use_xattn:
+        self.use_xattn = trial.suggest_categorical("use_xattn", [True, False])
+        if self.use_xattn:
             self.q_h = nn.Linear(embed_dim, embed_dim, bias=False)
             self.k_c = nn.Linear(embed_dim, embed_dim, bias=False)
             self.v_c = nn.Linear(embed_dim, embed_dim, bias=False)
-
             self.q_c = nn.Linear(embed_dim, embed_dim, bias=False)
             self.k_h = nn.Linear(embed_dim, embed_dim, bias=False)
             self.v_h = nn.Linear(embed_dim, embed_dim, bias=False)
-
             self.scale = embed_dim ** -0.5
-            merge_dim = 2 * embed_dim
-        else:
-            merge_dim = 2 * embed_dim
 
-        # Shared head
-        fc_hidden = trial.suggest_int("fc_hidden", 32, 512, log=True)
-        self.head = nn.Sequential(
+        merge_dim  = 2 * embed_dim
+        fc_hidden  = trial.suggest_int("fc_hidden", 32, 512, log=True)
+        self.head  = nn.Sequential(
             nn.Linear(merge_dim, fc_hidden),
             nn.SiLU(),
             nn.Dropout(dropout),
             nn.Linear(fc_hidden, 1)
         )
 
-    def forward(self, x):
-        # x: (B,2,200)
-        h = self.stream_h(x[:, 0, :].unsqueeze(1)).squeeze(-1)   # (B, C_h)
-        c = self.stream_c(x[:, 1, :].unsqueeze(1)).squeeze(-1)   # (B, C_c)
+    # ------------------------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x : (B, 2, W)
+        Ensures W ≥ max(total_stride_h, total_stride_c) before convolutions.
+        """
+        min_W = max(self.total_stride_h, self.total_stride_c)
+        assert x.size(-1) >= min_W, (
+            f"Spectrum width {x.size(-1)} smaller than minimal "
+            f"{min_W} required by convolutional strides."
+        )
 
-        h_emb = self.fc_h(h)                                     # (B, embed_dim)
-        c_emb = self.fc_c(c)                                     # (B, embed_dim)
+        # ¹H branch
+        h = self.stream_h(x[:, 0, :].unsqueeze(1)).squeeze(-1)  # (B, C_h)
+        # ¹³C branch
+        c = self.stream_c(x[:, 1, :].unsqueeze(1)).squeeze(-1)  # (B, C_c)
 
-        # Cross-attention or simple concat
+        h_emb = self.fc_h(h)
+        c_emb = self.fc_c(c)
+
         if self.use_xattn:
-            # H as query, C as key/value
-            att_hc = torch.softmax(
-                (self.q_h(h_emb) * self.k_c(c_emb)).sum(dim=1, keepdim=True) * self.scale,
+            # cross-attention: h attends to c and vice-versa
+            attn_h = torch.softmax(
+                (self.q_h(h_emb).unsqueeze(1) @ self.k_c(c_emb).unsqueeze(2)) * self.scale,
                 dim=-1
-            )
-            h_att = h_emb + att_hc * self.v_c(c_emb)
-
-            # C as query, H as key/value
-            att_ch = torch.softmax(
-                (self.q_c(c_emb) * self.k_h(h_emb)).sum(dim=1, keepdim=True) * self.scale,
+            ) @ self.v_c(c_emb).unsqueeze(1)
+            attn_c = torch.softmax(
+                (self.q_c(c_emb).unsqueeze(1) @ self.k_h(h_emb).unsqueeze(2)) * self.scale,
                 dim=-1
-            )
-            c_att = c_emb + att_ch * self.v_h(h_emb)
+            ) @ self.v_h(h_emb).unsqueeze(1)
+            h_emb = attn_h.squeeze(1)
+            c_emb = attn_c.squeeze(1)
 
-            merged = torch.cat([h_att, c_att], dim=1)   # (B, 2*embed_dim)
-        else:
-            merged = torch.cat([h_emb, c_emb], dim=1)   # (B, 2*embed_dim)
-
+        merged = torch.cat([h_emb, c_emb], dim=1)
         return self.head(merged).squeeze(1)
 
 # ---------------------------------------------------------------------------

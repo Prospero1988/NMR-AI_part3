@@ -86,6 +86,13 @@ def load_nmr_data(path_1h, path_13c):
     x_h = merged[h_cols].values  # (N, 200)
     x_c = merged[c_cols].values  # (N, 200)
 
+    # --- ASESERTIONS „SANITY CHECK” ---
+    W_h, W_c = x_h.shape[1], x_c.shape[1]
+    assert W_h == W_c, (
+        f"¹H has {W_h} columns, ¹³C has {W_c}. Spectra must share the same width!"
+    )
+    assert W_h >= 64, "A spectrum < 64 points is too short for CNN."
+
     # After stacking: (N, 2, 200)
     x_nmr = np.stack([x_h, x_c], axis=1)
 
@@ -100,84 +107,79 @@ def load_nmr_data(path_1h, path_13c):
 # =================================================================================
 class CNN2DAlt(nn.Module):
     """
-    2D CNN model for NMR data with alternative data shape.
+    2-D CNN for tensors shaped (B, 1, 2, W): 1 channel, height=2 (¹H & ¹³C), width=W.
     """
-    def __init__(self, trial):
-        super(CNN2DAlt, self).__init__()
+    def __init__(self, trial: optuna.Trial):
+        super().__init__()
 
+        # -------- hyper-parameters suggested by Optuna --------
         num_conv_layers = trial.suggest_int("cnn_num_layers", 1, 6)
-        kernel_size_w = trial.suggest_int("cnn_kernel_size", 3, 13, step=2)
-        dropout_cnn = trial.suggest_float("cnn_dropout", 0.1, 0.6, step=0.1)
-        batch_norm_on = trial.suggest_categorical("cnn_batch_norm", [True, False])
+        kernel_size_w   = trial.suggest_int("cnn_kernel_size", 3, 13, step=2)
+        dropout_cnn     = trial.suggest_float("cnn_dropout", 0.1, 0.6, step=0.1)
+        use_batch_norm  = trial.suggest_categorical("cnn_batch_norm", [True, False])
 
+        # -------- minimal input width required (stride=1, padding=0) --------
+        self.min_width_req = 1 + num_conv_layers * (kernel_size_w - 1)
+
+        # -------- convolutional stack --------
         conv_layers = []
         in_channels = 1
 
-        # First layer: kernel=(2, kernel_size_w)
-        out_channels = trial.suggest_int(f"cnn_out_channels_l0", 8, 256, log=True)
-        conv_layers.append(
-            nn.Conv2d(
-                in_channels,
-                out_channels,
-                kernel_size=(2, kernel_size_w),
-                stride=1,
-                padding=0
-            )
-        )
-        conv_layers.append(nn.SiLU(inplace=True))
-        if batch_norm_on:
+        # first layer: kernel (2, k_w)
+        out_channels = trial.suggest_int("cnn_out_channels_l0", 8, 256, log=True)
+        conv_layers += [
+            nn.Conv2d(in_channels, out_channels,
+                      kernel_size=(2, kernel_size_w),
+                      stride=1, padding=0),
+            nn.SiLU(inplace=True)
+        ]
+        if use_batch_norm:
             conv_layers.append(nn.BatchNorm2d(out_channels))
         conv_layers.append(nn.Dropout2d(p=dropout_cnn))
-
         in_channels = out_channels
 
-        # Remaining layers: kernel=(1, kernel_size_w)
+        # remaining layers: kernel (1, k_w)
         for i in range(1, num_conv_layers):
             out_channels = trial.suggest_int(f"cnn_out_channels_l{i}", 8, 256, log=True)
-
-            conv_layers.append(
-                nn.Conv2d(
-                    in_channels,
-                    out_channels,
-                    kernel_size=(1, kernel_size_w),
-                    stride=1,
-                    padding=0
-                )
-            )
-            conv_layers.append(nn.SiLU(inplace=True))
-            if batch_norm_on:
+            conv_layers += [
+                nn.Conv2d(in_channels, out_channels,
+                          kernel_size=(1, kernel_size_w),
+                          stride=1, padding=0),
+                nn.SiLU(inplace=True)
+            ]
+            if use_batch_norm:
                 conv_layers.append(nn.BatchNorm2d(out_channels))
             conv_layers.append(nn.Dropout2d(p=dropout_cnn))
-
             in_channels = out_channels
 
         self.conv = nn.Sequential(*conv_layers)
 
-        # Linear after global pooling
-        linear_out = trial.suggest_int("cnn_linear_out", 16, 256, log=True)
+        # -------- fully-connected head --------
+        linear_out   = trial.suggest_int("cnn_linear_out", 16, 256, log=True)
         self.fc_conv = nn.Linear(in_channels, linear_out)
 
-        out_dim = trial.suggest_int("final_hidden_dim", 16, 512, log=True)
+        hidden_dim    = trial.suggest_int("final_hidden_dim", 16, 512, log=True)
         dropout_final = trial.suggest_float("final_dropout", 0.0, 0.6, step=0.1)
         self.final_layers = nn.Sequential(
-            nn.Linear(linear_out, out_dim),
+            nn.Linear(linear_out, hidden_dim),
             nn.SiLU(inplace=True),
             nn.Dropout(p=dropout_final),
-            nn.Linear(out_dim, 1)
+            nn.Linear(hidden_dim, 1)
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, 1, 2, W)
-        x = self.conv(x)
-        # After first layer: (B, out_channels, 1, W'), after each next: (B, out_channels, 1, W''')
+        assert x.size(-1) >= self.min_width_req, (
+            f"Spectrum width {x.size(-1)} is smaller than the minimum "
+            f"{self.min_width_req} (layers={len(self.conv)//4}, "
+            f"kernel={self.conv[0].kernel_size[1]})."
+        )
 
-        # Global average pooling over width
-        x = torch.mean(x, dim=3)  # => (B, out_channels, 1)
-
-        x = x.squeeze(2)  # => (B, out_channels)
-        x = self.fc_conv(x)  # => (B, linear_out)
-        out = self.final_layers(x)
-        return out.squeeze(1)
+        x = self.conv(x)             # (B, C, 1, W′)
+        x = torch.mean(x, dim=3)     # global average over width → (B, C, 1)
+        x = x.squeeze(2)             # (B, C)
+        x = self.fc_conv(x)          # (B, linear_out)
+        return self.final_layers(x).squeeze(1)
 
 # =================================================================================
 # Utility functions
