@@ -53,7 +53,7 @@ def renumber_features(df: pd.DataFrame) -> pd.DataFrame:
     """Rename feature columns to FEATURE_001, FEATURE_002, … (continuous)."""
     meta, feats = split_meta_feat(df)
     renamed = {
-        f"FEATURE_{i:03d}": feats[col]
+        f"FEATURE_{i}": feats[col]
         for i, col in enumerate(feats.columns, start=1)
     }
     return pd.concat([meta, pd.DataFrame(renamed)], axis=1)
@@ -94,7 +94,7 @@ def add_features(df_h: pd.DataFrame, df_c: pd.DataFrame) -> pd.DataFrame:
     summed = feats_h.values + feats_c.values
     summed_df = pd.DataFrame(
         summed,
-        columns=[f"FEATURE_{i:03d}" for i in range(1, summed.shape[1] + 1)],
+        columns=[f"FEATURE_{i}" for i in range(1, summed.shape[1] + 1)],
     )
     return pd.concat([meta, summed_df], axis=1)
 
