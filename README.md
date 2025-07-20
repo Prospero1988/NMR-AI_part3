@@ -33,7 +33,7 @@ NMR-AI_part3/
 ├── 05_conda_environments/
 ├── 06_utility_scripts/
 ├── 07_williams_plots/
-├── 08_SHAP/
+└── 08_SHAP/
 ```
 
 ---
