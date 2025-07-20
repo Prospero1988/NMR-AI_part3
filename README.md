@@ -33,6 +33,7 @@ NMR-AI_part3/
 ├── 05_conda_environments/
 ├── 06_utility_scripts/
 ├── 07_williams_plots/
+├── 08_SHAP/
 ```
 
 ---
@@ -173,6 +174,41 @@ All scripts are internally documented.
 Each subfolder contains example input and configuration files needed to reproduce the full set of outputs.
 
 These outputs are suitable for generating Williams plots to assess the reliability and extrapolation limits of trained models.
+
+---
+
+## 08_SHAP
+
+This folder contains scripts for SHAP (SHapley Additive exPlanations)-based interpretability analysis of trained 1D CNN models.
+
+` 1D_CNN_SHAP_calculation.py` – generates SHAP values for models trained on fused ¹H|¹³C inputs.
+It loads a trained model and associated hyperparameters, computes SHAP values using randomly sampled background data (with seed), and outputs a CSV file with per-feature importance values.
+
+`Beeswarm_SHAP_chart.py` – generates beeswarm plots from SHAP CSV files, visualizing feature impact across samples.
+
+Each script is internally documented and can be executed independently.
+SHAP values allow insight into how different spectral regions contribute to model predictions, highlighting the complementary nature of ¹H and ¹³C representations in fused inputs.
+
+Usage:
+
+```bash
+# Step 1: Generate SHAP values
+python 1D_CNN_SHAP_calculation.py \
+  --input <input.csv> \
+  --model <model.pth> \
+  --summary <summary.txt> \
+  --output <shap_output.csv> \
+  --bg <number_of_background_samples>
+  --ntest <number_of_test_samples>
+  --seed <seed for randomization>
+
+# Step 2: Plot beeswarm SHAP chart
+python Beeswarm_SHAP_chart.py \
+  --shap <shap_output.csv> \
+  --input <input.csv> \
+  --out <output.png> \
+  --top <number_of_features_to_display>
+```
 
 ---
 
