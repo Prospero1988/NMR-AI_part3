@@ -668,12 +668,24 @@ def evaluate_model_with_cv(csv_path, trial_params, csv_name):
         final_mae = np.mean(mae_scores)
         q2 = np.mean(r2_scores)
         final_pearson = np.mean(pearson_scores)
+        rmse_std  = float(np.std(rmse_scores,  ddof=1))
+        rmse_cv   = float(rmse_std / final_rmse)
+        rmse_span = float(np.max(rmse_scores) - np.min(rmse_scores))
+        q2_std  = float(np.std(r2_scores,  ddof=1))
+        q2_cv   = float(q2_std / abs(q2) if q2 != 0 else 0.0)
+        q2_span = float(np.max(r2_scores) - np.min(r2_scores))
 
         # Log metrics
         mlflow.log_metric("RMSE", final_rmse)
         mlflow.log_metric("MAE", final_mae)
         mlflow.log_metric("Q2", q2)
         mlflow.log_metric("Pearson Correlation", final_pearson)
+        mlflow.log_metric("RMSE_fold_std",  rmse_std)
+        mlflow.log_metric("RMSE_fold_cv",   rmse_cv)
+        mlflow.log_metric("RMSE_fold_span", rmse_span)
+        mlflow.log_metric("Q2_fold_std",  q2_std)
+        mlflow.log_metric("Q2_fold_cv",   q2_cv)
+        mlflow.log_metric("Q2_fold_span", q2_span)
 
         # Save metrics to file
         summary = f"Best parameters:\n"
@@ -685,6 +697,14 @@ def evaluate_model_with_cv(csv_path, trial_params, csv_name):
         summary += f"10CV MAE: {final_mae}\n"
         summary += f"10CV Q2: {q2}\n"
         summary += f"10CV Pearson Correlation: {final_pearson}\n"
+        summary += "\n10CV FoldVariance:\n"
+        summary += f"  RMSE std:   {rmse_std}\n"
+        summary += f"  RMSE CV:    {rmse_cv}\n"
+        summary += f"  RMSE span:  {rmse_span}\n"
+        summary += "\n10CV FoldVariance (Q2):\n"
+        summary += f"  Q2 std:   {q2_std}\n"
+        summary += f"  Q2 CV:    {q2_cv}\n"
+        summary += f"  Q2 span:  {q2_span}\n"
 
         summary_file_name = f"{csv_name}_summary.txt"
         with open(summary_file_name, 'w') as f:
