@@ -85,9 +85,11 @@ def load_data(file_path):
     Returns:
         np.ndarray: Data as a NumPy array.
     """
-    data = pd.read_csv(file_path)
-    data = data.iloc[:, 1:]  # Exclude MOLECULE_NAME if present
-    return data.values  # Return as NumPy array
+    df = pd.read_csv(file_path)
+    molecule_names = df.iloc[:, 0].astype(str)
+
+    data = df.iloc[:, 1:]  # Exclude MOLECULE_NAME if present
+    return data.values, molecule_names  # Return as NumPy array
 
 def train_final_model(X, y, best_params, num_boost_round):
     """
@@ -196,7 +198,7 @@ def process_file(csv_file, input_directory):
     """
     try:
         logger = setup_logging('Training', f'training_{csv_file}.log')
-        data   = load_data(os.path.join(input_directory, csv_file))
+        data, molecule_names = load_data(os.path.join(input_directory, csv_file))
         y      = data[:, 0]
         X      = data[:, 1:]
 
@@ -258,7 +260,7 @@ def process_file(csv_file, input_directory):
             generate_and_log_plots(y, y_pred_final, csv_file, suffix="_final")
 
             # ---------- Williams for the final model ------------------------
-            compute_and_log_williams(X, y, y_pred_final, csv_file)
+            compute_and_log_williams(X, y, y_pred_final, csv_file, molecule_names=molecule_names)
 
             # ---------- model & artifact recording ----------------------------
             model_file = f"{os.path.splitext(csv_file)[0]}_final_model.pkl"
@@ -356,7 +358,8 @@ def compute_and_log_williams(
         X: np.ndarray,
         y_true: np.ndarray,
         y_pred: np.ndarray,
-        csv_file: str
+        csv_file: str,
+        molecule_names: pd.Series
     ):
     """
     Saves two files:
@@ -377,25 +380,29 @@ def compute_and_log_williams(
 
     p, n        = X_use.shape[1], X_use.shape[0]
     h_star      = 3 * (p + 1) / n         
-    out_mask    = (np.abs(std_resid) > 3) | (leverage > h_star)
 
     base        = os.path.splitext(csv_file)[0]
     full_path   = f"{base}_williams_full.csv"
     out_path    = f"{base}_williams_outliers.csv"
 
+    name_col = pd.Series(molecule_names, dtype=str).reset_index(drop=True)
+    assert len(name_col) == len(y_true), "MOLECULE_NAME length mismatch with data rows"
     full_df = pd.DataFrame({
+        "MOLECULE_NAME": name_col,
         "y_true"       : y_true,
         "y_pred"       : y_pred,
         "residual"     : residuals,
         "std_residual" : std_resid,
         "leverage"     : leverage,
     })
+
     full_df.to_csv(full_path, index=False)
-    full_df[out_mask].to_csv(out_path, index=False)
+
+    out_mask_df = (full_df["std_residual"].abs() > 3) | (full_df["leverage"] > h_star)
+    full_df[out_mask_df].to_csv(out_path, index=False)
 
     mlflow.log_artifact(full_path)
     mlflow.log_artifact(out_path)
-
 
 if __name__ == "__main__":
     main()

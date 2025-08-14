@@ -135,10 +135,11 @@ def load_data(file_path):
     Returns:
         pd.DataFrame: Data as a pandas DataFrame.
     """
-    data = pd.read_csv(file_path)
-    # Drop the non-numeric column (if any), e.g., MOLECULE_NAME
-    data = data.iloc[:, 1:]
-    return data  # Return as pandas DataFrame
+    df = pd.read_csv(file_path)
+    molecule_names = df.iloc[:, 0].astype(str)
+
+    data = df.iloc[:, 1:]
+    return data, molecule_names # Return as pandas DataFrame
 
 def train_final_model(X, y, best_params):
     """
@@ -253,7 +254,7 @@ def process_file(csv_file, input_directory):
         input_directory (str): Path to the input directory.
     """
     try:
-        data = load_data(os.path.join(input_directory, csv_file))
+        data, molecule_names = load_data(os.path.join(input_directory, csv_file))
 
         # Ensure data is a pandas DataFrame with proper columns
         # Assuming the target variable is in the first column after MOLECULE_NAME
@@ -361,7 +362,7 @@ def process_file(csv_file, input_directory):
             generate_and_log_plots(y, y_pred_final, csv_file, suffix='_final')
 
             # --------- Williams plot (finalny model) ----------
-            compute_and_log_williams(X, y, y_pred_final, csv_file)
+            compute_and_log_williams(X, y, y_pred_final, csv_file, molecule_names=molecule_names)
 
             # Log final model metrics
             mlflow.log_metrics({f'Final_{k}': v for k, v in final_metrics.items()})
@@ -464,7 +465,7 @@ def log_environment():
         except Exception as e:
             logging.warning(f"Could not log pip requirements: {e}")
 
-def compute_and_log_williams(X, y_true, y_pred, csv_file):
+def compute_and_log_williams(X, y_true, y_pred, csv_file, molecule_names=None):
     """
     Saves two files:
     • <name>_williams_full.csv
@@ -491,16 +492,24 @@ def compute_and_log_williams(X, y_true, y_pred, csv_file):
     full_fn = f"{base}_williams_full.csv"
     out_fn  = f"{base}_williams_outliers.csv"
 
-    full_df = pd.DataFrame({
+    cols = {
         "y_true"      : y_true,
         "y_pred"      : y_pred,
         "residual"    : residuals,
         "std_residual": std_resid,
         "leverage"    : leverage
-    })
+    }
+
+    if molecule_names is not None:
+        # Dociśnięcie indeksów, żeby na pewno się zgadzały
+        cols = {"MOLECULE_NAME": pd.Series(molecule_names).reset_index(drop=True), **cols}
+
+    full_df = pd.DataFrame(cols)
+
     full_df.to_csv(full_fn, index=False)
-    full_df[(np.abs(std_resid) > 3) | (leverage > h_star)].to_csv(out_fn,
-                                                                  index=False)
+
+    outliers_df = full_df[(full_df["std_residual"].abs() > 3) | (full_df["leverage"] > h_star)]
+    outliers_df.to_csv(out_fn, index=False)
 
     mlflow.log_artifact(full_fn)
     mlflow.log_artifact(out_fn)
