@@ -16,6 +16,8 @@ import torch
 import gc
 import signal
 import csv
+from copy import deepcopy
+from numbers import Number
 
 torch.backends.cudnn.benchmark = True           
 torch.backends.cuda.matmul.allow_tf32 = True    
@@ -66,15 +68,18 @@ use_amp = (device.type == "cuda")
 MAX_KSIZE_CAP = 31
 
 class TrialTimeout:
-    def __init__(self, seconds: int):
+    def __init__(self, seconds:int):
         self.seconds = seconds
+        self.enabled = hasattr(signal, "SIGALRM") and os.name == "posix"
     def _handler(self, signum, frame):
         raise TimeoutError(f"Trial exceeded {self.seconds} seconds.")
     def __enter__(self):
-        signal.signal(signal.SIGALRM, self._handler)
-        signal.alarm(self.seconds)
+        if self.enabled:
+            signal.signal(signal.SIGALRM, self._handler)
+            signal.alarm(self.seconds)
     def __exit__(self, exc_type, exc, tb):
-        signal.alarm(0)
+        if self.enabled:
+            signal.alarm(0)
 
 class EarlyStopping:
     """
@@ -170,18 +175,15 @@ def amp_opt_step(loss: torch.Tensor,
 
 
 def make_loader(dataset, batch_size, shuffle=True):
-    # Zero-problemowy wariant – żadnych workerów == brak pipe’ów/procesów
-    nw = 0
-    kwargs = dict(
+    return torch.utils.data.DataLoader(
         dataset=dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=nw,
+        num_workers=0,                     # ← kluczowa zmiana
         pin_memory=(device.type == 'cuda'),
         drop_last=True,
     )
-    # UWAGA: prefetch_factor i persistent_workers NIE ustawiamy przy nw==0
-    return torch.utils.data.DataLoader(**kwargs)
+
 
 def load_data(csv_path, target_column_name='LABEL'):
     """
@@ -313,6 +315,9 @@ class Net(nn.Module):
 
         self.activation_name = activation_name
 
+        # Przy SELU użyjemy AlphaDropout, inaczej standardowego Dropout
+        self.Dropout = nn.AlphaDropout if self.activation_name == 'selu' else nn.Dropout
+
         # Regularization
         self.regularization = trial.suggest_categorical('regularization', ['none', 'l1', 'l2'])
         if self.regularization == 'none':
@@ -372,7 +377,7 @@ class Net(nn.Module):
                 conv_layers.append(nn.BatchNorm1d(out_channels))
             conv_layers.append(activation)
             if dropout_conv > 0.0:
-                conv_layers.append(nn.Dropout(dropout_conv))
+                conv_layers.append(self.Dropout(dropout_conv))
             in_channels = out_channels
             input_length = output_length  # Update input length
 
@@ -390,7 +395,7 @@ class Net(nn.Module):
                 fc_layers.append(nn.BatchNorm1d(out_features))
             fc_layers.append(activation)
             if dropout_fc > 0.0:
-                fc_layers.append(nn.Dropout(dropout_fc))
+                fc_layers.append(self.Dropout(dropout_fc))
             in_features = out_features
 
         fc_layers.append(nn.Linear(in_features, 1))
@@ -520,6 +525,8 @@ def objective(trial, csv_path):
             kf = KFold(n_splits=5, shuffle=True, random_state=SEED)
             rmse_scores = []
 
+            report_step = 0
+
             for fold, (train_index, valid_index) in enumerate(kf.split(X_train), 1):
                 X_train_fold = X_train[train_index]
                 X_valid_fold = X_train[valid_index]
@@ -549,7 +556,7 @@ def objective(trial, csv_path):
                 early_stopping = EarlyStopping(patience=early_stop_patience, verbose=False)
 
                 # --- AMP scaler + prealloc walidacji (raz na fold) ---
-                scaler = amp.GradScaler('cuda', enabled=use_amp)
+                scaler = amp.GradScaler(enabled=use_amp)
                 X_valid_tensor = torch.as_tensor(X_valid_fold, dtype=torch.float32, device=device)
                 y_valid_tensor = torch.as_tensor(y_valid_fold, dtype=torch.float32, device=device)
                 # -----------------------------------------------------
@@ -564,6 +571,10 @@ def objective(trial, csv_path):
 
                 use_batch_norm_effective = any(isinstance(m, nn.BatchNorm1d) for m in model.modules())
 
+                best_val_loss = float("inf")
+                best_state_dict = None
+                best_epoch = -1
+
                 for epoch in range(epochs):
                     model.train()
                     epoch_loss_sum = 0.0
@@ -576,7 +587,7 @@ def objective(trial, csv_path):
 
                         # unikamy BN przy batch_size==1
                         if (batch_X.size(0) > 1) or (not use_batch_norm_effective):
-                            with amp.autocast('cuda', enabled=use_amp):
+                            with amp.autocast(device_type='cuda', enabled=use_amp):
                                 outputs = model(batch_X).squeeze()
                                 loss = criterion(outputs, batch_y)
 
@@ -598,7 +609,7 @@ def objective(trial, csv_path):
                     # --- Walidacja bez rekreacji tensorów ---
                     model.eval()
                     with torch.no_grad():
-                        with amp.autocast('cuda', enabled=use_amp):
+                        with amp.autocast(device_type='cuda', enabled=use_amp):
                             y_valid_pred_t = model(X_valid_tensor).squeeze()
                         val_loss_t = torch.nn.functional.mse_loss(y_valid_pred_t, y_valid_tensor)
                     val_loss = float(val_loss_t.detach().cpu())
@@ -607,10 +618,26 @@ def objective(trial, csv_path):
                     if use_scheduler:
                         scheduler.step(val_loss)
 
+                    # --- track best on validation ---
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        best_state_dict = deepcopy(model.state_dict())
+                        best_epoch = epoch
+
+                    step = (fold - 1) * epochs + epoch  # rośnie monotonicznie przez wszystkie foldy i epoki
+                    trial.report(float(val_loss), step=step)
+                    if trial.should_prune():
+                        raise optuna.TrialPruned(f"Pruned at fold={fold}, epoch={epoch}, val={val_loss:.5f}")
+
                     # Early stopping
                     early_stopping(val_loss)
                     if early_stopping.early_stop:
                         break
+
+                # PO pętli epok – rollback:
+                if best_state_dict is not None:
+                    model.load_state_dict(best_state_dict)
+                    #print(f"[Fold {fold}] Rollback to epoch {best_epoch} (val_loss={best_val_loss:.5f})")
 
                 # Evaluation
                 model.eval()
@@ -628,16 +655,17 @@ def objective(trial, csv_path):
                 # Memory management
                 del model, loader, dataset
                 gc.collect()
-                #torch.cuda.empty_cache()
+               # if torch.cuda.is_available():
+               #     torch.cuda.empty_cache()
 
             # Calculate mean RMSE
-            final_rmse = np.mean(rmse_scores)
+            final_rmse = float(np.mean(rmse_scores))
 
             # Log metric
-            mlflow.log_metric("Trial RMSE", final_rmse, step=trial.number)
+            mlflow.log_metric("Trial RMSE", float(final_rmse), step=int(trial.number))
 
             # Set trial attributes
-            trial.set_user_attr('rmse', final_rmse)
+            trial.set_user_attr('rmse', float(final_rmse))
 
             return final_rmse
 
@@ -715,6 +743,10 @@ def evaluate_model_with_cv(csv_path, trial_params, csv_name):
             X_train, X_test = X_full[train_index], X_full[test_index]
             y_train, y_test = y_full[train_index], y_full[test_index]
 
+            X_subtrain, X_val, y_subtrain, y_val = train_test_split(
+                X_train, y_train, test_size=0.15, random_state=SEED, shuffle=True
+            )
+
             # Create model with best parameters
             input_dim = X_train.shape[1]
             # Note: We need to create a trial object with parameters to pass to Net
@@ -768,21 +800,26 @@ def evaluate_model_with_cv(csv_path, trial_params, csv_name):
             early_stopping = EarlyStopping(patience=early_stop_patience, verbose=False)
 
             # --- AMP scaler + prealloc walidacji (raz na fold) ---
-            scaler = amp.GradScaler('cuda', enabled=use_amp)
-            X_test_tensor = torch.as_tensor(X_test, dtype=torch.float32, device=device)
-            y_test_tensor = torch.as_tensor(y_test, dtype=torch.float32, device=device)
+            scaler = amp.GradScaler(enabled=use_amp)
+            X_val_t  = torch.as_tensor(X_val,  dtype=torch.float32, device=device)
+            y_val_t  = torch.as_tensor(y_val,  dtype=torch.float32, device=device)
+            X_test_t = torch.as_tensor(X_test, dtype=torch.float32, device=device)
+            y_test_t = torch.as_tensor(y_test, dtype=torch.float32, device=device)
             # -----------------------------------------------------
 
             # Training
 
             dataset = torch.utils.data.TensorDataset(
-                torch.from_numpy(X_train),
-                torch.from_numpy(y_train)
+                torch.from_numpy(X_subtrain),
+                torch.from_numpy(y_subtrain)
             )
-
             loader = make_loader(dataset, batch_size, shuffle=True)
 
             use_batch_norm_effective = any(isinstance(m, nn.BatchNorm1d) for m in model.modules())
+
+            best_val_loss = float("inf")
+            best_state_dict = None
+            best_epoch = -1
 
             for epoch in range(epochs):
                 model.train()
@@ -795,53 +832,51 @@ def evaluate_model_with_cv(csv_path, trial_params, csv_name):
                     optimizer.zero_grad(set_to_none=True)
 
                     if (batch_X.size(0) > 1) or (not use_batch_norm_effective):
-                        with amp.autocast('cuda', enabled=use_amp):
-                            outputs = model(batch_X).squeeze()
-                            loss = criterion(outputs, batch_y)
-
+                        with amp.autocast(device_type='cuda', enabled=use_amp):
+                            out = model(batch_X).squeeze()
+                            loss = criterion(out, batch_y)
                             if model.regularization == 'l1':
-                                l1_norm = sum(p.abs().sum() for p in model.parameters())
-                                loss = loss + model.reg_rate * l1_norm
+                                loss = loss + model.reg_rate * sum(p.abs().sum() for p in model.parameters())
                             elif model.regularization == 'l2':
-                                l2_norm = sum(p.pow(2).sum() for p in model.parameters())
-                                loss = loss + model.reg_rate * l2_norm
-
-                        amp_opt_step(loss, optimizer, scaler, model, clip_grad_value, where="cv/train")
-
+                                loss = loss + model.reg_rate * sum(p.pow(2).sum() for p in model.parameters())
+                        amp_opt_step(loss, optimizer, scaler, model, clip_grad_value, where="cv/subtrain")
                         epoch_loss_sum += loss.detach().float().item()
-                    else:
-                        continue
 
                 model.eval()
-                with torch.no_grad():
-                    with amp.autocast('cuda', enabled=use_amp):
-                        y_valid_pred_t = model(X_test_tensor).squeeze()
-                    val_loss_t = torch.nn.functional.mse_loss(y_valid_pred_t, y_test_tensor)
-
-                # sprawdź predykcje walidacyjne (te z bieżącej epoki)
-                y_valid_pred = y_valid_pred_t.float().cpu().numpy()
-                assert_finite_array("Fold validation predictions (CV)", y_valid_pred)
-
+                with torch.no_grad(), amp.autocast('cuda', enabled=use_amp):
+                    y_val_pred_t = model(X_val_t).squeeze()
+                    val_loss_t = torch.nn.functional.mse_loss(y_val_pred_t, y_val_t)
+                y_val_pred = y_val_pred_t.float().cpu().numpy()
+                assert_finite_array("Fold val predictions (CV)", y_val_pred)
                 val_loss = float(val_loss_t.detach().cpu())
 
                 if use_scheduler:
                     scheduler.step(val_loss)
 
+                # track best + rollback info
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_state_dict = deepcopy(model.state_dict())
+                    best_epoch = epoch
+
                 early_stopping(val_loss)
                 if early_stopping.early_stop:
-                    print(f'Fold {fold}: Early stopping triggered at epoch {epoch+1}')
+                    print(f'Fold {fold}: Early stopping at epoch {epoch+1} (best val {best_val_loss:.5f})')
                     break
 
+
+            if best_state_dict is not None:
+                model.load_state_dict(best_state_dict)
+                print(f"[Fold {fold}] Rollback to epoch {best_epoch} (val_loss={best_val_loss:.5f})")
 
             # Evaluation
             model.eval()
             with torch.no_grad(), amp.autocast('cuda', enabled=use_amp):
-                y_test_pred_t = model(X_test_tensor).squeeze()
+                y_test_pred_t = model(X_test_t).squeeze()
             y_test_pred = y_test_pred_t.float().cpu().numpy()
-                
             assert_finite_array("Fold test predictions (CV)", y_test_pred)
 
-            y_test_true = y_test_tensor.cpu().numpy()
+            y_test_true = y_test
             rmse = np.sqrt(mean_squared_error(y_test_true, y_test_pred))
             mae  = mean_absolute_error(y_test_true, y_test_pred)
             r2   = r2_score(y_test_true, y_test_pred)
@@ -859,7 +894,8 @@ def evaluate_model_with_cv(csv_path, trial_params, csv_name):
             # Memory management
             del model, loader, dataset
             gc.collect()
-            #torch.cuda.empty_cache()
+           # if torch.cuda.is_available():
+           #     torch.cuda.empty_cache()
 
         # Calculate metrics
         final_rmse = round(np.mean(rmse_scores), 3)
@@ -942,52 +978,45 @@ def evaluate_model_with_cv(csv_path, trial_params, csv_name):
 
 def train_final_model(csv_path, trial_params, csv_name):
     """
-    Train the final model on the entire dataset and log the model to MLflow.
-
-    Args:
-        csv_path (str): Path to the CSV file.
-        trial_params (dict): Dictionary containing the trial parameters.
-        csv_name (str): Name of the CSV file (for logging purposes).
-
-    Raises:
-        Exception: If any error occurs during final model training or logging.
+    Final training with subtrain/val for scheduler+ES+rollback, optional auto fine-tune on full train,
+    then test on the held-out 10%.
     """
     try:
         # Load data
         X_full, y_full = load_data(csv_path, target_column_name='LABEL')
-
-        # Convert to tensor
         X_full = X_full.astype(np.float32)
         y_full = y_full.astype(np.float32)
 
-        # >>> Ten sam split 90/10 co w objective (SEED i test_size identyczne)
+        # Ten sam split 90/10 co w objective (TEST)
         X_train, X_test, y_train, y_test = train_test_split(
             X_full, y_full, test_size=0.10, random_state=SEED
         )
 
-        # Get best hyperparameters
+        # subtrain/val do sterowania trenowaniem
+        X_subtrain, X_val, y_subtrain, y_val = train_test_split(
+            X_train, y_train, test_size=0.15, random_state=SEED, shuffle=True
+        )
+
         params = trial_params
+        optimizer_name     = params.get('optimizer', 'adam')
+        learning_rate      = params.get('learning_rate', 1e-3)
+        adam_beta1         = params.get('adam_beta1', 0.9)
+        adam_beta2         = params.get('adam_beta2', 0.999)
+        sgd_momentum       = params.get('sgd_momentum', 0.0)
+        use_scheduler      = params.get('use_scheduler', False)
+        early_stop_pat     = params.get('early_stop_patience', 10)
+        clip_grad_value    = params.get('clip_grad_value', 1.0)
+        batch_size         = params.get('batch_size', 32)
+        epochs             = params.get('epochs', 100)
+        weight_decay       = params.get('weight_decay', 0.0)
+        scheduler_factor   = params.get('scheduler_factor', 0.5)
+        scheduler_patience = params.get('scheduler_patience', 5)
+        min_lr             = params.get('min_lr', 1e-5)
 
-        # Default values for missing parameters
-        optimizer_name = params.get('optimizer', 'adam')
-        learning_rate = params.get('learning_rate', 1e-3)
-        adam_beta1 = params.get('adam_beta1', 0.9)
-        adam_beta2 = params.get('adam_beta2', 0.999)
-        sgd_momentum = params.get('sgd_momentum', 0.0)
-        use_scheduler = params.get('use_scheduler', False)
-        early_stop_patience = params.get('early_stop_patience', 10)
-        clip_grad_value = params.get('clip_grad_value', 1.0)
-        batch_size = params.get('batch_size', 32)
-        epochs = params.get('epochs', 100)
-        weight_decay  = params.get('weight_decay', 0.0)
-
-        # Create model with best parameters
+        # Model
         input_dim = X_full.shape[1]
-        # Again, create a fake trial object
         trial_for_model = optuna.trial.FixedTrial(params)
         model = Net(trial_for_model, input_dim).to(device)
-
-        # Loss criterion
         criterion = nn.MSELoss()
 
         # Optimizer
@@ -995,24 +1024,20 @@ def train_final_model(csv_path, trial_params, csv_name):
             optimizer = optim.Adam(model.parameters(), lr=learning_rate,
                                    betas=(adam_beta1, adam_beta2), weight_decay=weight_decay)
         elif optimizer_name == 'sgd':
-            optimizer = optim.SGD(model.parameters(), lr=learning_rate, momentum=sgd_momentum, weight_decay=weight_decay)
+            optimizer = optim.SGD(model.parameters(), lr=learning_rate,
+                                  momentum=sgd_momentum, weight_decay=weight_decay)
         elif optimizer_name == 'rmsprop':
             optimizer = optim.RMSprop(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
         elif optimizer_name == 'adamw':
-            beta1 = params.get('adamw_beta1', 0.9)       # <<<
-            beta2 = params.get('adamw_beta2', 0.999)     # <<<
+            beta1 = params.get('adamw_beta1', 0.9)
+            beta2 = params.get('adamw_beta2', 0.999)
             optimizer = optim.AdamW(model.parameters(), lr=learning_rate,
-                                    betas=(beta1, beta2),
-                                    weight_decay=weight_decay)
+                                    betas=(beta1, beta2), weight_decay=weight_decay)
         else:
             raise ValueError(f"Unknown optimizer: {optimizer_name}")
 
-        # Scheduler for learning rate reduction on plateau
+        # Scheduler na VAL
         if use_scheduler:
-            scheduler_factor   = params.get('scheduler_factor', 0.5)
-            scheduler_patience = params.get('scheduler_patience', 5)
-            min_lr             = params.get('min_lr', 1e-5)
-
             scheduler = optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer, mode='min',
                 factor=scheduler_factor,
@@ -1020,85 +1045,127 @@ def train_final_model(csv_path, trial_params, csv_name):
                 min_lr=min_lr
             )
 
-        # Early stopping to prevent overfitting
-        early_stopping = EarlyStopping(patience=early_stop_patience, verbose=False)
+        # Early stopping + rollback
+        early_stopping = EarlyStopping(patience=early_stop_pat, verbose=False)
 
-        # Training loop
-
-        dataset = torch.utils.data.TensorDataset(
-            torch.tensor(X_train, dtype=torch.float32),
-            torch.tensor(y_train, dtype=torch.float32)
+        # Loaders i tensory
+        sub_ds = torch.utils.data.TensorDataset(
+            torch.from_numpy(X_subtrain), torch.from_numpy(y_subtrain)
         )
+        sub_loader = make_loader(sub_ds, batch_size, shuffle=True)
 
-        loader = make_loader(dataset, batch_size, shuffle=True)
-
-        scaler = amp.GradScaler('cuda', enabled=use_amp)
+        scaler = amp.GradScaler(enabled=use_amp)
         use_batch_norm_effective = any(isinstance(m, nn.BatchNorm1d) for m in model.modules())
 
+        X_val_t  = torch.as_tensor(X_val,  dtype=torch.float32, device=device)
+        y_val_t  = torch.as_tensor(y_val,  dtype=torch.float32, device=device)
+        X_test_t = torch.as_tensor(X_test, dtype=torch.float32, device=device)
+
+        best_val_loss = float("inf")
+        best_state_dict = None
+        best_epoch = -1
+
+        # ======= GŁÓWNY TRENING NA SUBTRAIN Z WALIDACJĄ =======
         for epoch in range(epochs):
             model.train()
-            epoch_loss_sum = 0.0
-
-            for batch_X, batch_y in loader:
+            for batch_X, batch_y in sub_loader:
                 batch_X = batch_X.to(device, non_blocking=True)
                 batch_y = batch_y.to(device, non_blocking=True)
 
                 optimizer.zero_grad(set_to_none=True)
 
                 if (batch_X.size(0) > 1) or (not use_batch_norm_effective):
-                    with amp.autocast('cuda', enabled=use_amp):
+                    with amp.autocast(device_type='cuda', enabled=use_amp):
                         outputs = model(batch_X).squeeze()
                         loss = criterion(outputs, batch_y)
-
                         if model.regularization == 'l1':
-                            l1_norm = sum(p.abs().sum() for p in model.parameters())
-                            loss = loss + model.reg_rate * l1_norm
+                            loss = loss + model.reg_rate * sum(p.abs().sum() for p in model.parameters())
                         elif model.regularization == 'l2':
-                            l2_norm = sum(p.pow(2).sum() for p in model.parameters())
-                            loss = loss + model.reg_rate * l2_norm
-
-                    amp_opt_step(loss, optimizer, scaler, model, clip_grad_value, where="final/train")
-
-                    epoch_loss_sum += loss.detach().float().item()
+                            loss = loss + model.reg_rate * sum(p.pow(2).sum() for p in model.parameters())
+                    amp_opt_step(loss, optimizer, scaler, model, clip_grad_value, where="final/subtrain")
                 else:
                     continue
 
-            # Średnia strata na epokę
-            epoch_loss_avg = epoch_loss_sum / max(1, len(loader))
+            # --- walidacja ---
+            model.eval()
+            with torch.no_grad(), amp.autocast('cuda', enabled=use_amp):
+                y_val_pred_t = model(X_val_t).squeeze()
+                val_loss_t = torch.nn.functional.mse_loss(y_val_pred_t, y_val_t)
+            val_loss = float(val_loss_t.detach().cpu())
 
             if use_scheduler:
-                scheduler.step(epoch_loss_avg)  # tu nie masz walidacji, więc użyj train loss
+                scheduler.step(val_loss)
 
-            # Early stopping na train loss (w finalnym treningu brak walidacji)
-            early_stopping(epoch_loss_avg)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_state_dict = deepcopy(model.state_dict())
+                best_epoch = epoch
+
+            early_stopping(val_loss)
             if early_stopping.early_stop:
-                print(f'Final model: Early stopping triggered at epoch {epoch+1}')
+                print(f'Final model: Early stopping at epoch {epoch+1} (best val {best_val_loss:.5f})')
                 break
 
+        # rollback do najlepszych wag wg VAL
+        if best_state_dict is not None:
+            model.load_state_dict(best_state_dict)
+            print(f"[Final] Rollback to epoch {best_epoch} (val_loss={best_val_loss:.5f})")
+
+        # ======= AUTO FINE-TUNE NA CAŁYM TRAIN (90%) =======
+        # Heurystyka epok: bazowo ~epochs/12, plus bonus za "głębokość" best_epoch; clamp 2..8
+        if best_epoch < 0:
+            best_epoch = 0
+        base_ft = max(2, epochs // 12)               # np. 100 ep -> 8
+        bonus   = (best_epoch + 1) // 20             # co 20 epok +1
+        fine_epochs = int(min(8, max(2, base_ft + bonus)))
+
+        # Obniż LR (bezpiecznie)
+        for g in optimizer.param_groups:
+            lowered = min(g['lr'] * 0.5, learning_rate * 0.1)
+            g['lr'] = max(min_lr, lowered)
+
+        full_ds = torch.utils.data.TensorDataset(
+            torch.from_numpy(X_train), torch.from_numpy(y_train)
+        )
+        full_loader = make_loader(full_ds, batch_size, shuffle=True)
+
+        model.train()
+        for _ in range(fine_epochs):
+            for batch_X, batch_y in full_loader:
+                batch_X = batch_X.to(device, non_blocking=True)
+                batch_y = batch_y.to(device, non_blocking=True)
+                optimizer.zero_grad(set_to_none=True)
+                if (batch_X.size(0) > 1) or (not use_batch_norm_effective):
+                    with amp.autocast(device_type='cuda', enabled=use_amp):
+                        out = model(batch_X).squeeze()
+                        loss = criterion(out, batch_y)
+                        if model.regularization == 'l1':
+                            loss = loss + model.reg_rate * sum(p.abs().sum() for p in model.parameters())
+                        elif model.regularization == 'l2':
+                            loss = loss + model.reg_rate * sum(p.pow(2).sum() for p in model.parameters())
+                    amp_opt_step(loss, optimizer, scaler, model, clip_grad_value, where="final/finetune")
+
+        # ---------- METRYKI na TRAIN (90%) ----------
         model.eval()
         with torch.no_grad(), amp.autocast('cuda', enabled=use_amp):
             y_train_pred_t = model(torch.from_numpy(X_train).to(device)).squeeze()
         y_train_pred = y_train_pred_t.float().cpu().numpy()
-
         assert_finite_array("Train predictions (final)", y_train_pred)
 
-        # ---------- METRYKI na train (90%) ----------
         rmse_train = float(np.sqrt(mean_squared_error(y_train, y_train_pred)))
         r2_train   = float(r2_score(y_train, y_train_pred))
         mlflow.log_metric("rmse_train", rmse_train)
         mlflow.log_metric("r2_train",   r2_train)
         print(f"RMSE_train: {rmse_train:.4f} | R2_train: {r2_train:.4f}")
-        summary_file_name = f"{csv_name}_summary.txt" 
-        with open(summary_file_name, "a") as f:         
+        summary_file_name = f"{csv_name}_summary.txt"
+        with open(summary_file_name, "a") as f:
             f.write(f"RMSE_train: {rmse_train}\n")
             f.write(f"R2_train:   {r2_train}\n")
 
-        # ---------- TEST na 10% (których Optuna nie widziała) ----------
-        X_test_t = torch.from_numpy(X_test).to(device)
+        # ---------- TEST 10% ----------
         with torch.no_grad(), amp.autocast('cuda', enabled=use_amp):
             y_test_pred_t = model(X_test_t).squeeze()
         y_test_pred = y_test_pred_t.float().cpu().numpy()
-
         assert_finite_array("Final test predictions", y_test_pred)
 
         rmse_test = float(np.sqrt(mean_squared_error(y_test, y_test_pred)))
@@ -1108,37 +1175,23 @@ def train_final_model(csv_path, trial_params, csv_name):
         mlflow.log_metric("rmse_test", rmse_test)
         mlflow.log_metric("mae_test",  mae_test)
         mlflow.log_metric("r2_test",   r2_test)
-
         print(f"RMSE_test: {rmse_test:.4f} | MAE_test: {mae_test:.4f} | R2_test: {r2_test:.4f}")
 
-        # dopisz do summary.txt
-        with open(summary_file_name, "a") as f:
-            f.write(f"RMSE_test: {rmse_test}\n")
-            f.write(f"MAE_test:  {mae_test}\n")
-            f.write(f"R2_test:   {r2_test}\n")
-
-        # zapisz predykcje z testu jako artefakt
+        # zapisz predykcje z testu
         test_pred_df = pd.DataFrame({"y_true": y_test, "y_pred": y_test_pred})
         test_pred_csv = f"{csv_name}_test_predictions.csv"
         test_pred_df.to_csv(test_pred_csv, index=False)
         mlflow.log_artifact(test_pred_csv)
 
-
         # ---------- WILLIAMS-plot (FULL TRAIN SET) ----------
         try:
-            # 1) leverage
-            X_feat = X_train.astype(np.float64)          # (N, p)
-            nz = X_feat.std(0) > 1e-12                 # usuń kolumny zerowej wariancji
+            X_feat = X_train.astype(np.float64)
+            nz = X_feat.std(0) > 1e-12
             X_std = (X_feat[:, nz] - X_feat[:, nz].mean(0)) / X_feat[:, nz].std(0)
-
             H = X_std @ np.linalg.pinv(X_std.T @ X_std) @ X_std.T
             leverage = np.diag(H)
-
-            # 2) standaryzowane residua
             residuals  = y_train - y_train_pred
             std_resid  = residuals / (rmse_train * np.sqrt(1.0 - leverage + 1e-12))
-
-            # 3) thresholdy
             p, n = X_std.shape[1], X_std.shape[0]
             h_star = 3.0 * (p + 1) / n
 
@@ -1149,63 +1202,43 @@ def train_final_model(csv_path, trial_params, csv_name):
                 "std_residual":  std_resid,
                 "leverage":      leverage,
             })
-
             full_csv = f"{csv_name}_williams_full.csv"
             out_csv  = f"{csv_name}_williams_outliers.csv"
             wdf.to_csv(full_csv, index=False)
             wdf[(np.abs(std_resid) > 3.0) | (leverage > h_star)].to_csv(out_csv, index=False)
-
             mlflow.log_artifact(full_csv)
             mlflow.log_artifact(out_csv)
         except Exception as w_exc:
             print(f"[WARN] Williams data not written: {w_exc}")
-        # -----------------------------------------------
 
         # Save final model
         model_file_name = f"{csv_name}_final_model.pth"
         torch.save(model.state_dict(), model_file_name)
         print(f"Final model saved as {model_file_name}")
 
-        # Move model to CPU and set to evaluation mode
-        model.to('cpu')
-        model.eval()
-        model = model.float()
-
-        # Prepare input_example
-        input_example = X_full[0:1].astype(np.float32)
-
-        # Create wrapped model
+        # Log to MLflow (CPU-wrapped)
+        model.to('cpu'); model.eval(); model = model.float()
         wrapped_model = WrappedModel(model)
-
-        # Define conda_env
+        input_example = X_full[0:1].astype(np.float32)
         conda_env = {
             'channels': ['defaults'],
             'dependencies': [
                 f'python={sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}',
                 'pip',
-                {
-                    'pip': [
-                        f'torch=={torch.__version__}',
-                        'mlflow',
-                    ],
-                },
+                {'pip': [f'torch=={torch.__version__}', 'mlflow']},
             ],
             'name': 'mlflow-env'
         }
-
-        # Set logging level to DEBUG
         import logging
         logging.getLogger("mlflow").setLevel(logging.DEBUG)
-
-        # Log model to MLflow
-        mlflow.pytorch.log_model(
-            wrapped_model,
-            artifact_path="model",
-            conda_env=conda_env,
-            input_example=input_example
-        )
-
+        mlflow.pytorch.log_model(wrapped_model, artifact_path="model", conda_env=conda_env, input_example=input_example)
         print(f"Final model logged to MLflow.")
+
+        # Porządki
+        del sub_loader, full_loader
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     except Exception as e:
         print(f"An error occurred during final model training: {e}")
@@ -1256,7 +1289,7 @@ if __name__ == '__main__':
                 def print_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial):
                     # Bezpieczne formatowanie wartości
                     val = trial.value
-                    val_txt = f"{val:.4f}" if isinstance(val, (float, int)) else "NA"
+                    val_txt = f"{val:.4f}" if isinstance(val, Number) else "NA"
                     state = trial.state.name
                     print(f"[Trial {trial.number:>4}] state={state}  RMSE={val_txt}", flush=True)
 
@@ -1286,16 +1319,29 @@ if __name__ == '__main__':
                             "params_json"
                         ])
 
-                study = optuna.create_study(direction="minimize")
+                study_name = f"{csv_name}_study"
+                storage = f"sqlite:///{csv_name}_optuna.sqlite3"
+
+                pruner = optuna.pruners.MedianPruner(
+                    n_startup_trials=20,   # nie ucinaj pierwszych 30 prób
+                    n_warmup_steps=2,      # i pierwszych 2 raportów/epok
+                )
+
+                study = optuna.create_study(
+                    study_name=study_name,
+                    direction="minimize",
+                    pruner=pruner,
+                    storage=storage,
+                    load_if_exists=True,   # wznowi, jeśli plik sqlite istnieje
+                )
+
                 study.optimize(
                     objective_wrapper,
                     n_trials=args.n_trials,
                     callbacks=[print_callback],
-                    show_progress_bar=True,      # built-in tqdm progress bar
+                    show_progress_bar=True,
                     catch=(ValueError,)
                 )
-
-                #torch.cuda.empty_cache()
 
                 # Log best parameters
                 best_trial = study.best_trial  # Rename variable to best_trial
@@ -1321,7 +1367,9 @@ if __name__ == '__main__':
                 mlflow.log_artifact(best_curve_csv)
 
                 # Log metrics
-                mlflow.log_metric("RMSE", best_trial.user_attrs.get('rmse', None))
+                rmse_attr = best_trial.user_attrs.get('rmse')
+                if rmse_attr is not None:
+                    mlflow.log_metric("RMSE", float(rmse_attr))
 
                 print(f"Best trial for {csv_file}:")
                 print(f"  Value (RMSE): {best_trial.value}")
