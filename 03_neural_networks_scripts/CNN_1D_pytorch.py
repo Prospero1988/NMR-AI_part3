@@ -14,14 +14,17 @@ import numpy as np
 import pandas as pd
 import torch
 import gc
-import signal
 import csv
 from copy import deepcopy
 from numbers import Number
+import time
 
-torch.backends.cudnn.benchmark = True           
-torch.backends.cuda.matmul.allow_tf32 = True    
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.allow_tf32 = True
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+
 try:
     torch.set_float32_matmul_precision('high')  
 except AttributeError:
@@ -67,19 +70,9 @@ use_amp = (device.type == "cuda")
 
 MAX_KSIZE_CAP = 31
 
-class TrialTimeout:
-    def __init__(self, seconds:int):
-        self.seconds = seconds
-        self.enabled = hasattr(signal, "SIGALRM") and os.name == "posix"
-    def _handler(self, signum, frame):
-        raise TimeoutError(f"Trial exceeded {self.seconds} seconds.")
-    def __enter__(self):
-        if self.enabled:
-            signal.signal(signal.SIGALRM, self._handler)
-            signal.alarm(self.seconds)
-    def __exit__(self, exc_type, exc, tb):
-        if self.enabled:
-            signal.alarm(0)
+# --- Logging switches ---
+SHOW_FOLD_LOGS = False 
+
 
 class EarlyStopping:
     """
@@ -134,6 +127,37 @@ class EarlyStopping:
                 if self.verbose:
                     print('Early stopping triggered.')
                 self.early_stop = True
+
+
+# --- Global knobs ---
+USE_OPTUNA_PRUNING = True  # włącz/wyłącz raportowanie do Optuny z epok
+
+def clean_cuda():
+    """Wyczyść GC + bufory CUDA po foldzie, żeby nie kumulować uchwytów."""
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    except Exception:
+        pass
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            #torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+
+def now_s():
+    return time.monotonic()
+
+def deadline_after(seconds: int) -> float:
+    return now_s() + float(seconds)
+
+def check_timeout(deadline_s: float, where: str = ""):
+    if now_s() > deadline_s:
+        where_txt = f" in {where}" if where else ""
+        raise TimeoutError(f"Trial exceeded time budget{where_txt}.")
 
 
 def assert_finite_array(name: str, arr: np.ndarray):
@@ -494,56 +518,61 @@ def objective(trial, csv_path):
     Returns:
         float: The value of the objective function (e.g., RMSE).
     """
-    # Per-trial hard timeout, np. 45 min = 2700 s
-    with TrialTimeout(3600):
-        try:
-            # Load and preprocess data
-            X_train_full, y_train_full = load_data(csv_path, target_column_name='LABEL')
+    deadline = deadline_after(3600)
+    try:
+        # Load and preprocess data
+        X_train_full, y_train_full = load_data(csv_path, target_column_name='LABEL')
 
-            # Convert to tensor
-            X_train_full = X_train_full.astype(np.float32)
-            y_train_full = y_train_full.astype(np.float32)
+        # Convert to tensor
+        X_train_full = X_train_full.astype(np.float32)
+        y_train_full = y_train_full.astype(np.float32)
 
-            # Split data into training and test sets
-            X_train, X_test, y_train, y_test = train_test_split(
-                X_train_full, y_train_full, test_size=0.1, random_state=SEED
-            )
+        # Split data into training and test sets
+        X_train, _, y_train, _ = train_test_split(
+            X_train_full, y_train_full, test_size=0.1, random_state=SEED
+        )
 
-            # Hyperparameter suggestions
-            batch_size = trial.suggest_int('batch_size', 16, 512, log=True)
-            epochs = trial.suggest_int('epochs', 50, 500, step=50)
-            early_stop_patience = trial.suggest_int('early_stop_patience', 5, 40)
-            use_scheduler = trial.suggest_categorical('use_scheduler', [True, False])
-            clip_grad_value = trial.suggest_float('clip_grad_value', 0.1, 10.0, step=0.1)
+        # Hyperparameter suggestions
+        batch_size = trial.suggest_int('batch_size', 16, 512, log=True)
+        epochs = trial.suggest_int('epochs', 50, 500, step=50)
+        early_stop_patience = trial.suggest_int('early_stop_patience', 5, 40)
+        use_scheduler = trial.suggest_categorical('use_scheduler', [True, False])
+        clip_grad_value = trial.suggest_float('clip_grad_value', 0.1, 10.0, step=0.1)
 
-            # Scheduler hyper-params
-            scheduler_factor   = trial.suggest_float('scheduler_factor', 0.1, 0.9)
-            scheduler_patience = trial.suggest_int('scheduler_patience', 2, 15)
-            min_lr             = trial.suggest_float('min_lr', 1e-6, 1e-3, log=True)
+        # Scheduler hyper-params
+        scheduler_factor   = trial.suggest_float('scheduler_factor', 0.1, 0.9)
+        scheduler_patience = trial.suggest_int('scheduler_patience', 2, 15)
+        min_lr             = trial.suggest_float('min_lr', 1e-6, 1e-3, log=True)
 
-            # KFold cross-validation
-            kf = KFold(n_splits=5, shuffle=True, random_state=SEED)
-            rmse_scores = []
+        # — raportowanie do prunera sterujemy prostym licznikiem —
+        report_idx = 0
 
-            report_step = 0
+        # progi „kiedy raportować” (zbalansowane)
+        PRUNE_MIN_EPOCHS = max(15, epochs // 5)   # zacznij po X epokach w danym foldzie
+        PRUNE_REPORT_EVERY = 5                    # raportuj co N epok
+        PRUNE_SKIP_FIRST_N_FOLDS = 0              # można dać 1, by nie cinać na 1. foldzie
 
-            for fold, (train_index, valid_index) in enumerate(kf.split(X_train), 1):
+        # KFold cross-validation
+        kf = KFold(n_splits=5, shuffle=True, random_state=SEED)
+
+        rmse_scores = []
+
+        for fold, (train_index, valid_index) in enumerate(kf.split(X_train), 1):
+            check_timeout(deadline, f"fold {fold} (start)")
+            model = loader = dataset = optimizer = None
+            X_valid_tensor = y_valid_tensor = None
+            try:
                 X_train_fold = X_train[train_index]
                 X_valid_fold = X_train[valid_index]
                 y_train_fold = y_train[train_index]
                 y_valid_fold = y_train[valid_index]
 
-                # Create model
                 input_dim = X_train_fold.shape[1]
                 model = Net(trial, input_dim).to(device)
 
-                # Loss criterion
                 criterion = nn.MSELoss()
-
-                # Optimizer
                 optimizer = get_optimizer(trial, model.parameters())
 
-                # Learning rate scheduler
                 if use_scheduler:
                     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
                         optimizer, mode='min',
@@ -552,142 +581,140 @@ def objective(trial, csv_path):
                         min_lr=min_lr
                     )
 
-                # Early stopping
                 early_stopping = EarlyStopping(patience=early_stop_patience, verbose=False)
 
-                # --- AMP scaler + prealloc walidacji (raz na fold) ---
                 scaler = amp.GradScaler(enabled=use_amp)
                 X_valid_tensor = torch.as_tensor(X_valid_fold, dtype=torch.float32, device=device)
                 y_valid_tensor = torch.as_tensor(y_valid_fold, dtype=torch.float32, device=device)
-                # -----------------------------------------------------
 
-                # Training
                 dataset = torch.utils.data.TensorDataset(
                     torch.from_numpy(X_train_fold),
                     torch.from_numpy(y_train_fold)
                 )
-
                 loader = make_loader(dataset, batch_size, shuffle=True)
 
                 use_batch_norm_effective = any(isinstance(m, nn.BatchNorm1d) for m in model.modules())
 
-                best_val_loss = float("inf")
+                best_val_mse = float("inf")
                 best_state_dict = None
                 best_epoch = -1
 
                 for epoch in range(epochs):
+                    check_timeout(deadline, f"fold {fold} / epoch {epoch}")
                     model.train()
-                    epoch_loss_sum = 0.0
-
+                    
                     for batch_X, batch_y in loader:
+                        check_timeout(deadline, f"fold {fold} / epoch {epoch} / batch")
                         batch_X = batch_X.to(device, non_blocking=True)
                         batch_y = batch_y.to(device, non_blocking=True)
 
                         optimizer.zero_grad(set_to_none=True)
 
-                        # unikamy BN przy batch_size==1
                         if (batch_X.size(0) > 1) or (not use_batch_norm_effective):
                             with amp.autocast(device_type='cuda', enabled=use_amp):
                                 outputs = model(batch_X).squeeze()
                                 loss = criterion(outputs, batch_y)
-
-                                # regularizacja (jak było)
                                 if model.regularization == 'l1':
-                                    l1_norm = sum(p.abs().sum() for p in model.parameters())
-                                    loss = loss + model.reg_rate * l1_norm
+                                    loss = loss + model.reg_rate * sum(p.abs().sum() for p in model.parameters())
                                 elif model.regularization == 'l2':
-                                    l2_norm = sum(p.pow(2).sum() for p in model.parameters())
-                                    loss = loss + model.reg_rate * l2_norm
+                                    loss = loss + model.reg_rate * sum(p.pow(2).sum() for p in model.parameters())
 
                             amp_opt_step(loss, optimizer, scaler, model, clip_grad_value, where="objective/train")
-
-                            # zliczanie do średniej straty na epokę
-                            epoch_loss_sum += loss.detach().float().item()
-                        else:
-                            continue
-
-                    # --- Walidacja bez rekreacji tensorów ---
+                            
+                    # --- Walidacja ---
                     model.eval()
                     with torch.no_grad():
                         with amp.autocast(device_type='cuda', enabled=use_amp):
                             y_valid_pred_t = model(X_valid_tensor).squeeze()
-                        val_loss_t = torch.nn.functional.mse_loss(y_valid_pred_t, y_valid_tensor)
-                    val_loss = float(val_loss_t.detach().cpu())
+                        val_mse_t = torch.nn.functional.mse_loss(y_valid_pred_t, y_valid_tensor)
 
-                    # Scheduler – karmy walidacją (lepsze niż train loss)
+                    val_mse  = float(val_mse_t.detach().cpu())
+                    val_rmse = float(np.sqrt(val_mse))
+
+                    # --- Optuna pruning: raportujemy RMSE z kontrolowaną kadencją ---
+                    if USE_OPTUNA_PRUNING:
+                        do_report = (
+                            (fold > PRUNE_SKIP_FIRST_N_FOLDS) and
+                            ((epoch + 1) >= PRUNE_MIN_EPOCHS) and
+                            (((epoch + 1) % PRUNE_REPORT_EVERY) == 0)
+                        )
+                        if do_report:
+                            trial.report(val_rmse, step=report_idx)  # step = 0,1,2,... w obrębie triala
+                            report_idx += 1
+                            if trial.should_prune():
+                                raise optuna.TrialPruned(
+                                    f"Pruned at fold={fold}, epoch={epoch}, val_rmse={val_rmse:.5f}"
+                                )
+
+                
+                    # --- Scheduler/ES na MSE (stabilna skala) ---
                     if use_scheduler:
-                        scheduler.step(val_loss)
+                        scheduler.step(val_mse)
 
-                    # --- track best on validation ---
-                    if val_loss < best_val_loss:
-                        best_val_loss = val_loss
+                    if val_mse < best_val_mse:
+                        best_val_mse = val_mse
                         best_state_dict = deepcopy(model.state_dict())
                         best_epoch = epoch
 
-                    step = (fold - 1) * epochs + epoch  # rośnie monotonicznie przez wszystkie foldy i epoki
-                    trial.report(float(val_loss), step=step)
-                    if trial.should_prune():
-                        raise optuna.TrialPruned(f"Pruned at fold={fold}, epoch={epoch}, val={val_loss:.5f}")
-
-                    # Early stopping
-                    early_stopping(val_loss)
+                    early_stopping(val_mse)
                     if early_stopping.early_stop:
                         break
 
-                # PO pętli epok – rollback:
                 if best_state_dict is not None:
                     model.load_state_dict(best_state_dict)
-                    #print(f"[Fold {fold}] Rollback to epoch {best_epoch} (val_loss={best_val_loss:.5f})")
+                    if SHOW_FOLD_LOGS:
+                        print(f"[Fold {fold}] Rollback to epoch {best_epoch} "
+                            f"(val_mse={best_val_mse:.5f}, val_rmse={np.sqrt(best_val_mse):.5f})")
 
-                # Evaluation
                 model.eval()
-                with torch.no_grad(), amp.autocast('cuda', enabled=use_amp):
+                with torch.no_grad(), amp.autocast(device_type='cuda', enabled=use_amp):
                     y_pred_t = model(X_valid_tensor).squeeze()
                 y_pred = y_pred_t.float().cpu().numpy()
                 y_true = y_valid_tensor.cpu().numpy()
 
                 assert_finite_array("Validation predictions (objective)", y_pred)
-
                 rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-
                 rmse_scores.append(rmse)
 
-                # Memory management
-                del model, loader, dataset
-                gc.collect()
-               # if torch.cuda.is_available():
-               #     torch.cuda.empty_cache()
+            finally:
+                if model is not None: del model
+                if loader is not None: del loader
+                if dataset is not None: del dataset
+                if optimizer is not None: del optimizer
+                if X_valid_tensor is not None: del X_valid_tensor
+                if y_valid_tensor is not None: del y_valid_tensor
+                clean_cuda()
 
-            # Calculate mean RMSE
-            final_rmse = float(np.mean(rmse_scores))
+        # Calculate mean RMSE
+        final_rmse = float(np.mean(rmse_scores))
 
-            # Log metric
-            mlflow.log_metric("Trial RMSE", float(final_rmse), step=int(trial.number))
+        # Log metric
+        mlflow.log_metric("Trial RMSE", float(final_rmse), step=int(trial.number))
 
-            # Set trial attributes
-            trial.set_user_attr('rmse', float(final_rmse))
+        # Set trial attributes
+        trial.set_user_attr('rmse', final_rmse)
 
-            return final_rmse
+        return final_rmse
 
-        except TimeoutError as te:
-            print(f"[Trial timeout] {te}")
-            # Timeout traktujemy jako normalną porażkę triala – Optuna i tak to ogarnie
-            raise te
+    except TimeoutError as te:
+        print(f"[Trial timeout] {te}")
+        # Timeout traktujemy jako normalną porażkę triala – Optuna i tak to ogarnie
+        raise te
 
-        except optuna.TrialPruned as pe:
-            # To jest nasz normalny „losowy zły zestaw parametrów”
-            print(f"[Trial pruned] {pe}")
-            raise
+    except optuna.TrialPruned as pe:
+        # To jest nasz normalny „losowy zły zestaw parametrów”
+        print(f"[Trial pruned] {pe}")
+        raise
 
-        except ValueError as ve:
-            # Na wszelki wypadek: stare ścieżki, gdyby coś jednak rzuciło ValueError
-            print(f"[Trial value error] {ve} -> pruning")
-            raise optuna.TrialPruned(str(ve))
+    except ValueError as ve:
+        # Na wszelki wypadek: stare ścieżki, gdyby coś jednak rzuciło ValueError
+        print(f"[Trial value error] {ve} -> pruning")
+        raise optuna.TrialPruned(str(ve))
 
-        except Exception as e:
-            # Prawdziwy błąd programistyczny – nie maskujemy
-            print(f"An unexpected error occurred in the objective function: {e}")
-            raise
+    except Exception as e:
+        # Prawdziwy błąd programistyczny – nie maskujemy
+        print(f"An unexpected error occurred in the objective function: {e}")
+        raise
 
 
 def evaluate_model_with_cv(csv_path, trial_params, csv_name):
@@ -740,162 +767,142 @@ def evaluate_model_with_cv(csv_path, trial_params, csv_name):
         min_lr             = params.get('min_lr', 1e-5)
 
         for fold, (train_index, test_index) in enumerate(kf.split(X_full), 1):
-            X_train, X_test = X_full[train_index], X_full[test_index]
-            y_train, y_test = y_full[train_index], y_full[test_index]
+            
+            model = loader = dataset = optimizer = None
+            X_val_t = y_val_t = X_test_t = y_test_t = None
 
-            X_subtrain, X_val, y_subtrain, y_val = train_test_split(
-                X_train, y_train, test_size=0.15, random_state=SEED, shuffle=True
-            )
+            try:
+                X_train, X_test = X_full[train_index], X_full[test_index]
+                y_train, y_test = y_full[train_index], y_full[test_index]
 
-            # Create model with best parameters
-            input_dim = X_train.shape[1]
-            # Note: We need to create a trial object with parameters to pass to Net
-            # However, Net requires a trial object. We can create a fake trial object with parameters.
-            trial_for_model = optuna.trial.FixedTrial(params)
-            model = Net(trial_for_model, input_dim).to(device)
-
-            # Loss criterion
-            criterion = nn.MSELoss()
-
-            # Optimizer
-            if optimizer_name == 'adam':
-                beta1 = params.get('adam_beta1', 0.9)
-                beta2 = params.get('adam_beta2', 0.999)
-                optimizer = optim.Adam(model.parameters(),
-                                    lr=learning_rate,
-                                    betas=(beta1, beta2),
-                                    weight_decay=weight_decay)
-
-            elif optimizer_name == 'adamw':
-                beta1 = params.get('adamw_beta1', 0.9)
-                beta2 = params.get('adamw_beta2', 0.999)
-                optimizer = optim.AdamW(model.parameters(),
-                                        lr=learning_rate,
-                                        betas=(beta1, beta2),
-                                        weight_decay=weight_decay)
-
-            elif optimizer_name == 'sgd':
-                optimizer = optim.SGD(model.parameters(),
-                                    lr=learning_rate,
-                                    momentum=sgd_momentum,
-                                    weight_decay=weight_decay)
-
-            elif optimizer_name == 'rmsprop':
-                optimizer = optim.RMSprop(model.parameters(),
-                                        lr=learning_rate,
-                                        weight_decay=weight_decay)
-            else:
-                raise ValueError(f"Unknown optimizer: {optimizer_name}")
-
-            # Scheduler
-            if use_scheduler:
-                scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                    optimizer, mode='min',
-                    factor=scheduler_factor,
-                    patience=scheduler_patience,
-                    min_lr=min_lr
+                X_subtrain, X_val, y_subtrain, y_val = train_test_split(
+                    X_train, y_train, test_size=0.15, random_state=SEED, shuffle=True
                 )
 
-            # Early stopping
-            early_stopping = EarlyStopping(patience=early_stop_patience, verbose=False)
+                input_dim = X_train.shape[1]
+                trial_for_model = optuna.trial.FixedTrial(params)
+                model = Net(trial_for_model, input_dim).to(device)
 
-            # --- AMP scaler + prealloc walidacji (raz na fold) ---
-            scaler = amp.GradScaler(enabled=use_amp)
-            X_val_t  = torch.as_tensor(X_val,  dtype=torch.float32, device=device)
-            y_val_t  = torch.as_tensor(y_val,  dtype=torch.float32, device=device)
-            X_test_t = torch.as_tensor(X_test, dtype=torch.float32, device=device)
-            y_test_t = torch.as_tensor(y_test, dtype=torch.float32, device=device)
-            # -----------------------------------------------------
+                criterion = nn.MSELoss()
 
-            # Training
-
-            dataset = torch.utils.data.TensorDataset(
-                torch.from_numpy(X_subtrain),
-                torch.from_numpy(y_subtrain)
-            )
-            loader = make_loader(dataset, batch_size, shuffle=True)
-
-            use_batch_norm_effective = any(isinstance(m, nn.BatchNorm1d) for m in model.modules())
-
-            best_val_loss = float("inf")
-            best_state_dict = None
-            best_epoch = -1
-
-            for epoch in range(epochs):
-                model.train()
-                epoch_loss_sum = 0.0
-
-                for batch_X, batch_y in loader:
-                    batch_X = batch_X.to(device, non_blocking=True)
-                    batch_y = batch_y.to(device, non_blocking=True)
-
-                    optimizer.zero_grad(set_to_none=True)
-
-                    if (batch_X.size(0) > 1) or (not use_batch_norm_effective):
-                        with amp.autocast(device_type='cuda', enabled=use_amp):
-                            out = model(batch_X).squeeze()
-                            loss = criterion(out, batch_y)
-                            if model.regularization == 'l1':
-                                loss = loss + model.reg_rate * sum(p.abs().sum() for p in model.parameters())
-                            elif model.regularization == 'l2':
-                                loss = loss + model.reg_rate * sum(p.pow(2).sum() for p in model.parameters())
-                        amp_opt_step(loss, optimizer, scaler, model, clip_grad_value, where="cv/subtrain")
-                        epoch_loss_sum += loss.detach().float().item()
-
-                model.eval()
-                with torch.no_grad(), amp.autocast('cuda', enabled=use_amp):
-                    y_val_pred_t = model(X_val_t).squeeze()
-                    val_loss_t = torch.nn.functional.mse_loss(y_val_pred_t, y_val_t)
-                y_val_pred = y_val_pred_t.float().cpu().numpy()
-                assert_finite_array("Fold val predictions (CV)", y_val_pred)
-                val_loss = float(val_loss_t.detach().cpu())
+                if optimizer_name == 'adam':
+                    beta1 = params.get('adam_beta1', 0.9)
+                    beta2 = params.get('adam_beta2', 0.999)
+                    optimizer = optim.Adam(model.parameters(), lr=learning_rate, betas=(beta1, beta2), weight_decay=weight_decay)
+                elif optimizer_name == 'adamw':
+                    beta1 = params.get('adamw_beta1', 0.9)
+                    beta2 = params.get('adamw_beta2', 0.999)
+                    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, betas=(beta1, beta2), weight_decay=weight_decay)
+                elif optimizer_name == 'sgd':
+                    optimizer = optim.SGD(model.parameters(), lr=learning_rate, momentum=sgd_momentum, weight_decay=weight_decay)
+                elif optimizer_name == 'rmsprop':
+                    optimizer = optim.RMSprop(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+                else:
+                    raise ValueError(f"Unknown optimizer: {optimizer_name}")
 
                 if use_scheduler:
-                    scheduler.step(val_loss)
+                    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                        optimizer, mode='min',
+                        factor=scheduler_factor,
+                        patience=scheduler_patience,
+                        min_lr=min_lr
+                    )
 
-                # track best + rollback info
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    best_state_dict = deepcopy(model.state_dict())
-                    best_epoch = epoch
+                early_stopping = EarlyStopping(patience=early_stop_patience, verbose=False)
 
-                early_stopping(val_loss)
-                if early_stopping.early_stop:
-                    print(f'Fold {fold}: Early stopping at epoch {epoch+1} (best val {best_val_loss:.5f})')
-                    break
+                scaler = amp.GradScaler(enabled=use_amp)
+                X_val_t  = torch.as_tensor(X_val,  dtype=torch.float32, device=device)
+                y_val_t  = torch.as_tensor(y_val,  dtype=torch.float32, device=device)
+                X_test_t = torch.as_tensor(X_test, dtype=torch.float32, device=device)
+                y_test_t = torch.as_tensor(y_test, dtype=torch.float32, device=device)
 
+                dataset = torch.utils.data.TensorDataset(
+                    torch.from_numpy(X_subtrain),
+                    torch.from_numpy(y_subtrain)
+                )
+                loader = make_loader(dataset, batch_size, shuffle=True)
 
-            if best_state_dict is not None:
-                model.load_state_dict(best_state_dict)
-                print(f"[Fold {fold}] Rollback to epoch {best_epoch} (val_loss={best_val_loss:.5f})")
+                use_batch_norm_effective = any(isinstance(m, nn.BatchNorm1d) for m in model.modules())
 
-            # Evaluation
-            model.eval()
-            with torch.no_grad(), amp.autocast('cuda', enabled=use_amp):
-                y_test_pred_t = model(X_test_t).squeeze()
-            y_test_pred = y_test_pred_t.float().cpu().numpy()
-            assert_finite_array("Fold test predictions (CV)", y_test_pred)
+                best_val_loss = float("inf")
+                best_state_dict = None
+                best_epoch = -1
 
-            y_test_true = y_test
-            rmse = np.sqrt(mean_squared_error(y_test_true, y_test_pred))
-            mae  = mean_absolute_error(y_test_true, y_test_pred)
-            r2   = r2_score(y_test_true, y_test_pred)
-            pearson_corr, _ = pearsonr(y_test_true, y_test_pred)
+                for epoch in range(epochs):
+                    model.train()
+                    
+                    for batch_X, batch_y in loader:
+                        batch_X = batch_X.to(device, non_blocking=True)
+                        batch_y = batch_y.to(device, non_blocking=True)
+                        optimizer.zero_grad(set_to_none=True)
 
-            rmse_scores.append(rmse)
-            mae_scores.append(mae)
-            r2_scores.append(r2)
-            pearson_scores.append(pearson_corr)
+                        if (batch_X.size(0) > 1) or (not use_batch_norm_effective):
+                            with amp.autocast(device_type='cuda', enabled=use_amp):
+                                out = model(batch_X).squeeze()
+                                loss = criterion(out, batch_y)
+                                if model.regularization == 'l1':
+                                    loss = loss + model.reg_rate * sum(p.abs().sum() for p in model.parameters())
+                                elif model.regularization == 'l2':
+                                    loss = loss + model.reg_rate * sum(p.pow(2).sum() for p in model.parameters())
+                            amp_opt_step(loss, optimizer, scaler, model, clip_grad_value, where="cv/subtrain")
+                            
 
-            # Collect predictions
-            all_true.extend(y_test_true)
-            all_preds.extend(y_test_pred)
+                    model.eval()
+                    with torch.no_grad(), amp.autocast(device_type='cuda', enabled=use_amp):
+                        y_val_pred_t = model(X_val_t).squeeze()
+                        val_loss_t = torch.nn.functional.mse_loss(y_val_pred_t, y_val_t)
+                    y_val_pred = y_val_pred_t.float().cpu().numpy()
+                    assert_finite_array("Fold val predictions (CV)", y_val_pred)
 
-            # Memory management
-            del model, loader, dataset
-            gc.collect()
-           # if torch.cuda.is_available():
-           #     torch.cuda.empty_cache()
+                    val_loss = float(val_loss_t.detach().cpu())
+                    if use_scheduler:
+                        scheduler.step(val_loss)
+
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        best_state_dict = deepcopy(model.state_dict())
+                        best_epoch = epoch
+
+                    early_stopping(val_loss)
+                    if early_stopping.early_stop:
+                        print(f'Fold {fold}: Early stopping at epoch {epoch+1} (best val {best_val_loss:.5f})')
+                        break
+
+                if best_state_dict is not None:
+                    model.load_state_dict(best_state_dict)
+                    if SHOW_FOLD_LOGS:
+                        print(f"[Fold {fold}] Rollback to epoch {best_epoch} (val_loss={best_val_loss:.5f})")
+
+                model.eval()
+                with torch.no_grad(), amp.autocast(device_type='cuda', enabled=use_amp):
+                    y_test_pred_t = model(X_test_t).squeeze()
+                y_test_pred = y_test_pred_t.float().cpu().numpy()
+                assert_finite_array("Fold test predictions (CV)", y_test_pred)
+
+                y_test_true = y_test_t.cpu().numpy()
+                rmse = np.sqrt(mean_squared_error(y_test_true, y_test_pred))
+                mae  = mean_absolute_error(y_test_true, y_test_pred)
+                r2   = r2_score(y_test_true, y_test_pred)
+                pearson_corr, _ = pearsonr(y_test_true, y_test_pred)
+
+                rmse_scores.append(rmse)
+                mae_scores.append(mae)
+                r2_scores.append(r2)
+                pearson_scores.append(pearson_corr)
+
+                all_true.extend(y_test_true)
+                all_preds.extend(y_test_pred)
+
+            finally:
+                if model is not None: del model
+                if loader is not None: del loader
+                if dataset is not None: del dataset
+                if optimizer is not None: del optimizer
+                if X_val_t is not None: del X_val_t
+                if y_val_t is not None: del y_val_t
+                if X_test_t is not None: del X_test_t
+                if y_test_t is not None: del y_test_t
+                clean_cuda()
 
         # Calculate metrics
         final_rmse = round(np.mean(rmse_scores), 3)
@@ -1088,7 +1095,7 @@ def train_final_model(csv_path, trial_params, csv_name):
 
             # --- walidacja ---
             model.eval()
-            with torch.no_grad(), amp.autocast('cuda', enabled=use_amp):
+            with torch.no_grad(), amp.autocast(device_type='cuda', enabled=use_amp):
                 y_val_pred_t = model(X_val_t).squeeze()
                 val_loss_t = torch.nn.functional.mse_loss(y_val_pred_t, y_val_t)
             val_loss = float(val_loss_t.detach().cpu())
@@ -1109,7 +1116,8 @@ def train_final_model(csv_path, trial_params, csv_name):
         # rollback do najlepszych wag wg VAL
         if best_state_dict is not None:
             model.load_state_dict(best_state_dict)
-            print(f"[Final] Rollback to epoch {best_epoch} (val_loss={best_val_loss:.5f})")
+            if SHOW_FOLD_LOGS:
+                print(f"[Final] Rollback to epoch {best_epoch} (val_loss={best_val_loss:.5f})")
 
         # ======= AUTO FINE-TUNE NA CAŁYM TRAIN (90%) =======
         # Heurystyka epok: bazowo ~epochs/12, plus bonus za "głębokość" best_epoch; clamp 2..8
@@ -1147,7 +1155,7 @@ def train_final_model(csv_path, trial_params, csv_name):
 
         # ---------- METRYKI na TRAIN (90%) ----------
         model.eval()
-        with torch.no_grad(), amp.autocast('cuda', enabled=use_amp):
+        with torch.no_grad(), amp.autocast(device_type='cuda', enabled=use_amp):
             y_train_pred_t = model(torch.from_numpy(X_train).to(device)).squeeze()
         y_train_pred = y_train_pred_t.float().cpu().numpy()
         assert_finite_array("Train predictions (final)", y_train_pred)
@@ -1163,7 +1171,7 @@ def train_final_model(csv_path, trial_params, csv_name):
             f.write(f"R2_train:   {r2_train}\n")
 
         # ---------- TEST 10% ----------
-        with torch.no_grad(), amp.autocast('cuda', enabled=use_amp):
+        with torch.no_grad(), amp.autocast(device_type='cuda', enabled=use_amp):
             y_test_pred_t = model(X_test_t).squeeze()
         y_test_pred = y_test_pred_t.float().cpu().numpy()
         assert_finite_array("Final test predictions", y_test_pred)
@@ -1177,11 +1185,20 @@ def train_final_model(csv_path, trial_params, csv_name):
         mlflow.log_metric("r2_test",   r2_test)
         print(f"RMSE_test: {rmse_test:.4f} | MAE_test: {mae_test:.4f} | R2_test: {r2_test:.4f}")
 
-        # zapisz predykcje z testu
+        # --- zapisz predykcje z testu (NAJPIERW) ---
         test_pred_df = pd.DataFrame({"y_true": y_test, "y_pred": y_test_pred})
         test_pred_csv = f"{csv_name}_test_predictions.csv"
         test_pred_df.to_csv(test_pred_csv, index=False)
         mlflow.log_artifact(test_pred_csv)
+
+        # --- dopisz metryki z TEST 10% do summary (POTEM) ---
+        summary_file_name = f"{csv_name}_summary.txt"
+        with open(summary_file_name, "a") as f:
+            f.write("\nHeld-out 10% TEST metrics:\n")
+            f.write(f"rmse_test: {rmse_test:.3f}\n")
+            f.write(f"mae_test:  {mae_test:.3f}\n")
+            f.write(f"r2_test:   {r2_test:.3f}\n")
+            f.write(f"test_predictions_csv: {test_pred_csv}\n")
 
         # ---------- WILLIAMS-plot (FULL TRAIN SET) ----------
         try:
@@ -1229,16 +1246,14 @@ def train_final_model(csv_path, trial_params, csv_name):
             ],
             'name': 'mlflow-env'
         }
-        import logging
+        
         logging.getLogger("mlflow").setLevel(logging.DEBUG)
         mlflow.pytorch.log_model(wrapped_model, artifact_path="model", conda_env=conda_env, input_example=input_example)
         print(f"Final model logged to MLflow.")
 
         # Porządki
         del sub_loader, full_loader
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        clean_cuda()
 
     except Exception as e:
         print(f"An error occurred during final model training: {e}")
@@ -1285,22 +1300,44 @@ if __name__ == '__main__':
                     tags=tags_config_CNN_1D.mlflow_tags1
             ) as optuna_run:
 
-                # --- Custom callback to print each finished trial result ---
-                def print_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial):
-                    # Bezpieczne formatowanie wartości
-                    val = trial.value
-                    val_txt = f"{val:.4f}" if isinstance(val, Number) else "NA"
-                    state = trial.state.name
-                    print(f"[Trial {trial.number:>4}] state={state}  RMSE={val_txt}", flush=True)
+                def _last_intermediate_rmse(trial: optuna.trial.FrozenTrial):
+                    # po zmianie w objective() raportujemy RMSE, więc wartości są już w RMSE
+                    if not trial.intermediate_values:
+                        return None
+                    _, v = sorted(trial.intermediate_values.items())[-1]
+                    try:
+                        return float(v) if v is not None else None
+                    except Exception:
+                        return None
 
+                def print_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial):
+                    state = trial.state.name
+                    final_val = trial.value          # RMSE dla COMPLETE, None dla PRUNED
+                    last_rmse = _last_intermediate_rmse(trial)
+
+                    if isinstance(final_val, Number):
+                        label, val_txt = "RMSE", f"{float(final_val):.4f}"
+                        val_csv = float(final_val)
+                    elif last_rmse is not None:
+                        label, val_txt = "last_val_RMSE", f"{last_rmse:.4f}"
+                        val_csv = last_rmse
+                    else:
+                        label, val_txt, val_csv = "val", "", ""
+
+                    print(f"[Trial {trial.number:>4}] state={state}  {label}={val_txt}", flush=True)
+
+                    # CSV
                     try:
                         now = datetime.now().isoformat(timespec="seconds")
-                        best_val = study.best_value
-                        best_num = study.best_trial.number
+                        try:
+                            best_val_csv = f"{float(study.best_value):.6f}"
+                            best_num_csv = str(study.best_trial.number)
+                        except Exception:
+                            best_val_csv, best_num_csv = "", ""
                         params_json = json.dumps(trial.params, ensure_ascii=False)
                         with open(best_curve_csv, "a", newline="", encoding="utf-8") as f:
                             writer = csv.writer(f)
-                            writer.writerow([now, trial.number, val, best_val, best_num, params_json])
+                            writer.writerow([now, trial.number, val_csv, best_val_csv, best_num_csv, params_json])
                     except Exception as e:
                         print(f"[WARN] Nie udało się dopisać do {best_curve_csv}: {e}", flush=True)
 
@@ -1322,10 +1359,15 @@ if __name__ == '__main__':
                 study_name = f"{csv_name}_study"
                 storage = f"sqlite:///{csv_name}_optuna.sqlite3"
 
-                pruner = optuna.pruners.MedianPruner(
-                    n_startup_trials=20,   # nie ucinaj pierwszych 30 prób
-                    n_warmup_steps=2,      # i pierwszych 2 raportów/epok
+                base_pruner = optuna.pruners.MedianPruner(
+                    n_startup_trials=30,   # zanim zacznie ciąć, zbierz 30 pełnych prób
+                    n_warmup_steps=3,     # i odczekaj 3 raportów (epok) wewnątrz triala
+                    interval_steps=1       
                 )
+                try:
+                    pruner = optuna.pruners.PatientPruner(base_pruner, patience=2)
+                except AttributeError:
+                    pruner = base_pruner
 
                 study = optuna.create_study(
                     study_name=study_name,
@@ -1340,7 +1382,7 @@ if __name__ == '__main__':
                     n_trials=args.n_trials,
                     callbacks=[print_callback],
                     show_progress_bar=True,
-                    catch=(ValueError,)
+                    catch=(TimeoutError, RuntimeError, ValueError)
                 )
 
                 # Log best parameters
