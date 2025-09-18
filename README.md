@@ -232,16 +232,6 @@ To define your own tags, modify the corresponding `tags_config_*.py` files.
 
 ---
 
-## Citation
-
-This repository supports the following manuscript:  
-**[Title Placeholder]**  
-*Authors: A. Leniak et al.*  
-*Submitted 2025*  
-DOI: *[Placeholder]*
-
----
-
 ## Contact
 
 For questions, bug reports, or collaboration ideas, please feel free to contact me.
