@@ -4,8 +4,17 @@
 
 # NMR-AI_part3: Input Data & Scripts
 
-This repository contains the datasets and source code used in the third publication of the *From NMR to AI* series:  
-**[Title Placeholder]**, *[DOI Placeholder]*.
+This repository contains the datasets and source code used in the third publication of the *From NMR to AI* series.  
+For more detailed information, check the original Open Access research paper:
+
+Leniak, A.; Pietruś, W.; Kurczab, R. From NMR to AI: Fusing 1H and 13C Representations 
+for Enhanced QSPR Modeling. J Chem Inf Model 2025. 
+[https://doi.org/10.1021/acs.jcim.5c01791](https://doi.org/10.1021/acs.jcim.5c01791).
+
+**If you use those scripts and software in your research, please cite our publication.**
+
+---
+
 
 All scripts are fully integrated with **[MLflow](https://mlflow.org/)** for experiment tracking and **[Optuna](https://optuna.org/)** for hyperparameter optimization.  
 They support reproducible experiments, model comparison, and artifact logging across all stages of training and evaluation.
