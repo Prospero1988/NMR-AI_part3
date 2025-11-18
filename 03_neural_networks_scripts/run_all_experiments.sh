@@ -2,7 +2,7 @@
 # Script to run experiments for neural networks models.
 
 echo "Starting experiments CNN 1D Models"
-python3 CNN_1D_pytorch.py --csv_path "./input" --experiment_name "CNN_1D_pytorch" --n_trials 20
+python3 CNN_1D_pytorch.py --csv_path "./input" --experiment_name "lipo_logD_74_JASON" --n_trials 2000
 
 echo ""
 

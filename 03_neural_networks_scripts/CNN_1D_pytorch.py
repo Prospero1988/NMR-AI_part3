@@ -932,8 +932,8 @@ def evaluate_model_with_cv(csv_path, trial_params, csv_name):
             summary += f"{key}: {value}\n"
 
         summary += f"\n10CV Metrics:\n"
-        summary += f"10CV RMSE: {final_rmse}\n"
-        summary += f"10CV MAE: {final_mae}\n"
+        summary += f"10CV RMSE: {round(final_rmse, 3)}\n"
+        summary += f"10CV MAE: {round(final_mae, 3)}\n"
         summary += f"10CV Q2: {q2}\n"
         summary += f"10CV Pearson Correlation: {final_pearson}\n"
         summary += "\n10CV FoldVariance:\n"
@@ -950,8 +950,8 @@ def evaluate_model_with_cv(csv_path, trial_params, csv_name):
         mlflow.log_artifact(summary_file_name)
 
         print(f"\nValidation set evaluation for {csv_name}:")
-        print(f"  10CV RMSE: {final_rmse}")
-        print(f"  10CV MAE: {final_mae}")
+        print(f"  10CV RMSE: {round(final_rmse, 3)}")
+        print(f"  10CV MAE: {round(final_mae, 3)}")
         print(f"  10CV Q2: {q2}")
         print(f"  10CV Pearson Correlation: {final_pearson}")
 
